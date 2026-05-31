@@ -1,0 +1,23 @@
+{
+  "name": "@payments/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@payments/db": "*",
+    "dotenv": "^16.0.3",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "*",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.19.19",
+    "tsx": "^4.0.0",
+    "typescript": "5.9.2"
+  }
+}

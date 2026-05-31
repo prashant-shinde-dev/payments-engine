@@ -1,0 +1,69 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  phoneNumber  String        @unique
+  firstName    String
+  lastName     String
+  passwordHash String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  wallet       Wallet?
+  sentTxns     Transaction[] @relation("SentTransactions")
+  receivedTxns Transaction[] @relation("ReceivedTransactions")
+}
+
+model Wallet {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  balance   Decimal  @db.Decimal(20, 2)
+  currency  String   @default("INR")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model Transaction {
+  id         String            @id @default(uuid())
+  fromUserId String
+  toUserId   String
+  amount     Decimal           @db.Decimal(20, 2)
+  type       TransactionType
+  status     TransactionStatus
+  note       String?
+  createdAt  DateTime          @default(now())
+
+  fromUser User @relation("SentTransactions", fields: [fromUserId], references: [id])
+  toUser   User @relation("ReceivedTransactions", fields: [toUserId], references: [id])
+
+  @@index([fromUserId, createdAt])
+  @@index([toUserId, createdAt])
+}
+
+enum TransactionType {
+  P2P_TRANSFER
+  BANK_DEPOSIT
+  BANK_WITHDRAWAL
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
