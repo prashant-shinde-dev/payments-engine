@@ -108,7 +108,8 @@ that drift from the actual schema.
 Schema-generated TypeScript types mean the database and application
 types are always in sync — no manual `interface User` that drifts from
 the actual table. Migration history is tracked automatically.
-For a portfolio repo, Prisma is recognisable and respected.
+Prisma is a mature, widely adopted client, which keeps onboarding
+and long-term maintenance cost low.
 
 **Trade-offs:**
 `SELECT FOR UPDATE` requires `prisma.$queryRaw` — slightly less ergonomic.
@@ -155,7 +156,8 @@ No drift between frontend and backend validation rules — ever.
 
 **Context:**
 Monetary amounts must be stored in the database. The choice of data type
-is a hire/no-hire signal at fintech companies.
+directly determines whether monetary arithmetic is exact — getting it
+wrong corrupts balances in ways that are hard to detect and harder to reverse.
 
 **Options Considered:**
 
@@ -226,9 +228,10 @@ access tokens paired with long-lived refresh tokens.
 **Decision:** JWT access token only for Layer 1.
 
 **Rationale:**
-Layer 1 priority is a working system. A stateless JWT is the simplest
-correct implementation. The known weakness (no revocation) is acceptable
-at this stage because: (a) tokens expire, (b) no real users.
+A stateless JWT is the simplest correct implementation for first-pass
+authentication. The known weakness (no revocation before expiry) is bounded
+by a short token TTL (15 minutes), which caps the exposure window of a
+leaked token until refresh-token rotation lands.
 
 **Known weakness:** Stolen JWT is valid until expiry. No way to invalidate
 on logout or suspicious activity. This is a documented, intentional gap.

@@ -10,12 +10,18 @@
   },
   "dependencies": {
     "@payments/db": "*",
+    "@payments/types": "*",
+    "bcrypt": "^6.0.0",
     "dotenv": "^16.0.3",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@repo/typescript-config": "*",
+    "@types/bcrypt": "^6.0.0",
     "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.19.19",
     "tsx": "^4.0.0",
     "typescript": "5.9.2"

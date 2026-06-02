@@ -1,11 +1,11 @@
 # Payments Engine
 
-A production-grade payments engine built to demonstrate engineering depth
-in financial systems — not a tutorial project.
+A production-grade payments engine for moving money between accounts,
+with correctness, atomicity, and auditability as first-class concerns.
 
 ---
 
-## What This Demonstrates
+## Core Capabilities
 
 **Idempotent payment processing**
 Duplicate requests (network retries, double-clicks) are detected and
