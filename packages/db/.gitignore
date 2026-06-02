@@ -2,12 +2,12 @@ node_modules
 
 .env
 
-/generated/prisma
+# Generated code (Prisma client, etc.) — not tracked; regenerated on install
+/src/generated
 
 dist
- .next 
- .env
- *.tsbuildinfo
+.next
+*.tsbuildinfo
 
- .turbo
- .DS_Store  
+.turbo
+.DS_Store
