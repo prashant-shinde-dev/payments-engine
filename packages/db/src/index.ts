@@ -10,4 +10,9 @@ export const prisma: PrismaClient =
 
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
-export type { PrismaClient, Prisma } from "./generated/prisma/client.js";
+export type {
+  PrismaClient,
+  Prisma,
+  TransactionStatus,
+  TransactionType,
+} from "./generated/prisma/client.js";

@@ -24,6 +24,36 @@ export const loginSchema = z.object({
   password: z.string().min(1, "please provide password"),
 });
 
-export type RegisterInputs = z.infer<typeof registerSchema>;
+export const transactionSchema = z.object({
+  receiver: z.uuid(),
+  amount: z
+    .string()
+    .regex(/^(?:[1-9]\d{0,19}|(?:[1-9]\d{0,17}|0)\.\d{1,2})$/, {
+      message: "please provide a valid amount",
+    })
+    .refine(
+      (val) => {
+        if (val === "0.00" || val === "0.0") {
+          return false;
+        }
+        return true;
+      },
+      { message: "the transfer amount cant be zero" },
+    ),
+});
 
+export const paginationSchema = z.object({
+  page: z
+    .string()
+    .regex(/^[1-9]\d*$/, { message: "the page number is invalid" })
+    .optional(),
+  pageSize: z
+    .string()
+    .regex(/^[1-9]\d*$/, { message: "the page size is invalid" })
+    .optional(),
+});
+
+export type RegisterInputs = z.infer<typeof registerSchema>;
+export type PaginationInputs = z.infer<typeof paginationSchema>;
 export type LoginInputs = z.infer<typeof loginSchema>;
+export type TransactionInputs = z.infer<typeof transactionSchema>;
