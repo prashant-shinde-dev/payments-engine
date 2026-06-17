@@ -15,8 +15,8 @@ export class AppError extends Error {
 }
 
 export class NotFoundError extends AppError {
-  constructor(resource: string, id: string) {
-    super("NOT_FOUND", `${resource} ${id} not found`, 404);
+  constructor(message: string) {
+    super("NOT_FOUND", message, 404);
   }
 }
 
@@ -35,5 +35,11 @@ export class ConflictError extends AppError {
 export class UnauthorizedError extends AppError {
   constructor(message: string) {
     super("UNAUTHORIZED", message, 401);
+  }
+}
+
+export class InsufficientFundsError extends AppError {
+  constructor(message: string) {
+    super("INSUFFICIENT_FUNDS", message, 402);
   }
 }
