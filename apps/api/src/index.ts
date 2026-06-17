@@ -2,8 +2,10 @@ import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import { prisma } from "@payments/db/client";
 import { router as authRouter } from "./routes/auth.routes.js";
+import { router as walletRouter } from "./routes/wallet.route.js";
 
 import { AppError } from "./errors/index.js";
+import { authenticate } from "./middleware/auth.middleware.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -14,6 +16,7 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/api/v1/auth", authRouter);
+app.use("/api/v1/wallet", authenticate, walletRouter);
 
 app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
   if (err instanceof AppError) {
