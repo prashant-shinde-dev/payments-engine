@@ -97,24 +97,31 @@ export async function send(data: {
   if (!receiverWallet) {
     throw new NotFoundError("receiver's wallet could not be found");
   }
-  const senderWallet = await prisma.wallet.findUnique({
-    where: {
-      userId: sender,
-    },
-    select: {
-      balance: true,
-    },
-  });
-
-  if (!senderWallet) {
-    throw new NotFoundError("sender's wallet could not be found");
-  }
-
-  if (amt.comparedTo(senderWallet.balance) > 0) {
-    throw new InsufficientFundsError("insufficient funds to send money");
-  }
 
   const transaction = await prisma.$transaction(async (txn) => {
+    await txn.$queryRaw`
+    SELECT * FROM "Wallet"
+    WHERE "userId" IN ( ${sender}, ${receiver})
+    ORDER BY  "userId" ASC
+    FOR UPDATE
+    `;
+    const senderWallet = await txn.wallet.findUnique({
+      where: {
+        userId: sender,
+      },
+      select: {
+        balance: true,
+      },
+    });
+
+    if (!senderWallet) {
+      throw new NotFoundError("sender's wallet could not be found");
+    }
+
+    if (amt.comparedTo(senderWallet.balance) > 0) {
+      throw new InsufficientFundsError("insufficient funds to send money");
+    }
+
     await txn.wallet.update({
       where: {
         userId: receiver,
@@ -159,8 +166,10 @@ export async function send(data: {
         },
       },
     });
+
     return createdTxn;
   });
+
   const transactionDetails = {
     sender: `${transaction.fromUser.firstName} ${transaction.fromUser.lastName}`,
     receiver: `${transaction.toUser.firstName} ${transaction.toUser.lastName}`,
