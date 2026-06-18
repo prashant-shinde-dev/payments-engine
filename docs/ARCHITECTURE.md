@@ -185,9 +185,10 @@ Failure cases:
   → Sender === receiver         → 400 Bad Request
   → DB transaction fails        → 500, rolled back atomically
 
-⚠ Known Layer 1 gap: no SELECT FOR UPDATE
-  Concurrent transfers to the same wallet can overdraft.
-  Demonstrated and fixed in Layer 2.
+✓ Concurrency-safe (Layer 2): the transfer locks BOTH wallet rows with
+  SELECT … FOR UPDATE, ordered by userId, inside the transaction. Concurrent
+  transfers from the same wallet can no longer overdraft, and opposite-direction
+  transfers cannot deadlock. See ADR-010.
 ```
 
 ### GET /wallet/balance
@@ -216,7 +217,7 @@ These are intentional. Each will be demonstrated as a failure, then fixed.
 
 | Limitation | Risk | Fix in |
 |---|---|---|
-| No `SELECT FOR UPDATE` on transfer | Concurrent transfers can overdraft | Layer 2 |
+| No `SELECT FOR UPDATE` on transfer | Concurrent transfers can overdraft | ✅ Fixed — ADR-010 |
 | No idempotency keys | Duplicate requests send money twice | Layer 2 |
 | No async bank processing | Timeout mid-transfer loses money | Layer 2 |
 | No refresh tokens | Stolen JWT has no revocation path | Layer 2 |

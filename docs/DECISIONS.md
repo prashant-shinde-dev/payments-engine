@@ -307,3 +307,70 @@ to prevent job loss on restart.
 - Event replay becomes a requirement → evaluate Kafka
 - Complex routing with multiple independent consumers → evaluate RabbitMQ
 - >100k jobs/day and Redis becomes a bottleneck → evaluate Kafka
+
+---
+
+## ADR-010: Pessimistic Row Locking + Deterministic Order for Concurrent Transfers
+
+**Status:** Accepted
+**Date:** Layer 2
+
+**Context:**
+A transfer reads a balance, decides, then writes. Under concurrency two transfers from
+the same wallet can read the same stale balance, both pass the funds check, and both
+debit → lost update → negative balance. A transfer also touches two rows (debit sender,
+credit receiver); concurrent opposite-direction transfers can deadlock if those rows are
+locked in inconsistent order.
+
+**Decision:**
+Pessimistic locking with `SELECT … FOR UPDATE` **inside** the transaction, locking **both**
+wallet rows in a single statement ordered by `userId` ascending, under the default
+READ COMMITTED isolation. All reads/writes use the transaction client (`txn`), never the
+global pooled client.
+
+**Rationale:**
+- **Blocking over retry.** `FOR UPDATE` (block, then re-read fresh) over Serializable +
+  client-side retry → simpler app code; per-wallet contention is acceptable at this scale.
+- **Order by the row, not the role.** Ordering the single lock statement by the stable
+  `userId` value makes every transfer acquire locks in the same global order → no deadlock
+  cycle, regardless of direction. Ordering by sender/receiver *role* would flip with
+  direction and reintroduce the deadlock.
+- **Lock both up front.** With both rows locked by the one statement, the later
+  `increment`/`decrement` acquire no new locks, so credit-vs-debit order is irrelevant.
+- **`txn`, not `prisma`.** The lock lives on the transaction's connection; reading via the
+  global client would run on a different pooled connection that doesn't hold the lock.
+
+**Trade-offs:**
+Concurrent transfers from the *same* wallet serialize (throughput bound by lock-hold time).
+Relies on PostgreSQL acquiring locks in `ORDER BY` order — verified by a forced-delay
+deadlock test in both directions. The `ORDER BY` is load-bearing and must not be removed.
+
+**Revisit when:**
+- A single wallet becomes a write hotspot → queue-per-wallet or optimistic concurrency
+- A future operation must read *both* balances as decision inputs → reassess lock scope
+
+---
+
+## ADR-011: Transfer Idempotency Deferred to a Dedicated Ticket
+
+**Status:** Accepted — deferred
+**Date:** Layer 2
+
+**Context:**
+`POST /wallet/transfer` is a money-moving mutation. A client retry (timeout, dropped
+connection) could submit the same transfer twice and move money twice. Idempotency — e.g.
+an `Idempotency-Key` header with stored-result replay — prevents this.
+
+**Decision:**
+Idempotency is **out of scope** for the concurrency-safety work and deferred to a dedicated
+follow-up ticket.
+
+**Rationale:**
+This ticket's scope is correctness under *concurrent* execution (lost update, deadlock).
+Retry-safety is an orthogonal concern with its own design surface — key storage, replay
+semantics, unique-constraint races. Bundling them would bloat the change and muddy review;
+tracking it separately keeps each change atomic and reviewable.
+
+**Consequence:**
+Until the follow-up ships, a retried transfer request can double-move money. This is a
+known, documented gap — surfaced in the PR's Known Limitations — not a silent omission.
