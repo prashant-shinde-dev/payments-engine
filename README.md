@@ -145,8 +145,8 @@ GET  /wallet/transactions?page=1&limit=20
 
 | Layer | Description | Status |
 |---|---|---|
-| Layer 1 | Core functionality — auth, wallet, P2P transfer | In Progress |
-| Layer 2 | Correctness under pressure — idempotency, locking, async bank | Upcoming |
+| Layer 1 | Core functionality — auth, wallet, P2P transfer | Complete |
+| Layer 2 | Correctness under pressure — idempotency, locking, async bank | In Progress |
 | Layer 3 | Scale — CQRS, fraud detection, reconciliation | Upcoming |
 
 ---
