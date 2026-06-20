@@ -28,7 +28,7 @@ export const transactionSchema = z.object({
   receiver: z.uuid(),
   amount: z
     .string()
-    .regex(/^(?:[1-9]\d{0,19}|(?:[1-9]\d{0,17}|0)\.\d{1,2})$/, {
+    .regex(/^(?:[1-9]\d{0,17}|(?:[1-9]\d{0,17}|0)\.\d{1,2})$/, {
       message: "please provide a valid amount",
     })
     .refine(
