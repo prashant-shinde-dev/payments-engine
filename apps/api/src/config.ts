@@ -7,5 +7,4 @@ function requireEnv(key: string): string {
 export const config = {
   jwtSecret: requireEnv("JWT_SECRET"),
   port: process.env.PORT || "3001",
-  nodeEnv: process.env.NODE_ENV || "development",
 };

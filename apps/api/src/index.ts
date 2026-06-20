@@ -4,11 +4,12 @@ import { prisma } from "@payments/db/client";
 import { router as authRouter } from "./routes/auth.routes.js";
 import { router as walletRouter } from "./routes/wallet.route.js";
 
+import { config } from "./config.js";
 import { AppError } from "./errors/index.js";
 import { authenticate } from "./middleware/auth.middleware.js";
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = config.port;
 app.use(express.json());
 
 app.get("/health", (req, res) => {
