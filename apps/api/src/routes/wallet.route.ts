@@ -6,8 +6,8 @@ import {
 } from "../services/wallet.service.js";
 
 import { paginationSchema, transactionSchema } from "@payments/zod-schemas";
-import { ValidationError } from "../errors/index.js";
 import { ApiResponse } from "@payments/types";
+import { validate } from "../middleware/validation.js";
 
 export const router = express.Router();
 
@@ -25,13 +25,7 @@ router.get("/balance", async (req: Request, res: Response) => {
 
 router.get("/transactions", async (req: Request, res: Response) => {
   const { userId } = req.user!;
-  const response = paginationSchema.safeParse(req.query);
-  if (!response.success) {
-    throw new ValidationError(response.error.message);
-  }
-
-  const { page, pageSize } = response.data;
-
+  const { page, pageSize } = validate(paginationSchema, req.query);
   const transactions = await getTransactions(
     userId,
     page ? Number(page) : undefined,
@@ -44,14 +38,8 @@ router.get("/transactions", async (req: Request, res: Response) => {
     >);
 });
 router.post("/transfer", async (req: Request, res: Response) => {
-  const response = transactionSchema.safeParse(req.body);
-  if (!response.success) {
-    throw new ValidationError(response.error.message);
-  }
-  const { receiver, amount } = response.data;
-
+  const { receiver, amount } = validate(transactionSchema, req.body);
   const sender = req.user!.userId;
-
   const transaction = await send({ sender, receiver, amount });
   res
     .status(201)
