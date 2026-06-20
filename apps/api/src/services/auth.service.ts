@@ -1,22 +1,20 @@
 import { config } from "../config.js";
 import { RegisterInputs, LoginInputs } from "@payments/zod-schemas";
 import { SafeUser, ApiResponse } from "@payments/types";
-import { prisma } from "@payments/db/client";
+import { Prisma, prisma } from "@payments/db/client";
 import bcrypt from "bcrypt";
 import { ConflictError, UnauthorizedError } from "../errors/index.js";
 import jwt from "jsonwebtoken";
+
+const DECOY_HASH = bcrypt.hashSync("decoy-not-a-real-password", 12);
 
 export async function login(
   data: LoginInputs,
 ): Promise<ApiResponse<{ user: SafeUser; token: string }>> {
   const user = await prisma.user.findUnique({ where: { email: data.email } });
-  if (!user) {
-    throw new UnauthorizedError("Unauthorized User");
-  }
-
-  const checkPassword = await bcrypt.compare(data.password, user.passwordHash);
-
-  if (!checkPassword) {
+  const hash = user?.passwordHash ?? DECOY_HASH;
+  const checkPassword = await bcrypt.compare(data.password, hash);
+  if (!user || !checkPassword) {
     throw new UnauthorizedError("Unauthorized User");
   }
   return buildAuthResponse(user);
@@ -25,33 +23,34 @@ export async function login(
 export async function register(
   data: RegisterInputs,
 ): Promise<ApiResponse<{ user: SafeUser; token: string }>> {
-  const [existingEmail, existingPhoneNumber] = await Promise.all([
-    prisma.user.findUnique({ where: { email: data.email } }),
-    prisma.user.findUnique({ where: { phoneNumber: data.phoneNumber } }),
-  ]);
-  if (existingEmail || existingPhoneNumber) {
-    throw new ConflictError(
-      "An account with this email or phone already exists",
-    );
-  }
-
   const passwordHash = await bcrypt.hash(data.password, 12);
   const { password: _password, ...rest } = data;
   const userInputs = { ...rest, passwordHash };
 
-  const user = await prisma.$transaction(async (txn) => {
-    const user = await txn.user.create({ data: userInputs });
+  try {
+    const user = await prisma.$transaction(async (txn) => {
+      const created = await txn.user.create({ data: userInputs });
 
-    await txn.wallet.create({
-      data: {
-        userId: user.id,
-        balance: 0,
-      },
+      await txn.wallet.create({
+        data: {
+          userId: created.id,
+          balance: 0,
+        },
+      });
+      return created;
     });
-    return user;
-  });
-
-  return buildAuthResponse(user);
+    return buildAuthResponse(user);
+  } catch (e) {
+    if (
+      e instanceof Prisma.PrismaClientKnownRequestError &&
+      e.code === "P2002"
+    ) {
+      throw new ConflictError(
+        "An account with this email or phone already exists",
+      );
+    }
+    throw e;
+  }
 }
 
 function buildAuthResponse(user: {
