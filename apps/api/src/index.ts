@@ -23,7 +23,11 @@ app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
   if (err instanceof AppError) {
     res.status(err.statusCode).json({
       success: false,
-      error: { code: err.code, message: err.message },
+      error: {
+        code: err.code,
+        message: err.message,
+        ...(err.details !== undefined ? { details: err.details } : {}),
+      },
     });
   } else {
     console.error("[unhandled error]", err);
