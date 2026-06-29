@@ -1,4 +1,5 @@
 import {
+  Prisma,
   prisma,
   TransactionStatus,
   TransactionType,
@@ -26,12 +27,16 @@ type TransactionHistory = {
   transactions: TransactionRecord[];
   total: number;
 };
-
+type TransferInputs = {
+  sender: string;
+  receiver: string;
+  amount: string;
+};
 type TransferResult = {
   sender: string;
   receiver: string;
-  timestamp: Date;
   amount: Decimal;
+  timestamp: Date;
   status: TransactionStatus;
   type: TransactionType;
 };
@@ -69,74 +74,78 @@ export async function getTransactions(
   return { transactions, total };
 }
 
-export async function send(data: {
-  sender: string;
-  receiver: string;
-  amount: string;
-}): Promise<TransferResult> {
+export async function send(data: TransferInputs): Promise<TransferResult> {
+  const transaction = await prisma.$transaction(async (txn) => {
+    return await transferCore(txn, data);
+  });
+
+  return transaction;
+}
+
+export async function transferCore(
+  txn: Prisma.TransactionClient,
+  data: TransferInputs,
+): Promise<TransferResult> {
   const { sender, receiver, amount } = data;
   const amt = new Decimal(amount);
 
   if (sender === receiver) {
     throw new ConflictError("cant send money to self");
   }
-
-  const transaction = await prisma.$transaction(async (txn) => {
-    // Lock both wallet rows up front, ordered by the stable userId value (NOT the
-    // sender/receiver role). A consistent global lock order means two opposite-
-    // direction transfers can never each hold the row the other needs -> no deadlock.
-    // This ORDER BY is load-bearing; do not remove it.
-    const lockedRows = await txn.$queryRaw<{ userId: string }[]>`
+  // Lock both wallet rows up front, ordered by the stable userId value (NOT the
+  // sender/receiver role). A consistent global lock order means two opposite-
+  // direction transfers can never each hold the row the other needs -> no deadlock.
+  // This ORDER BY is load-bearing; do not remove it.
+  const lockedRows = await txn.$queryRaw<{ userId: string }[]>`
       SELECT "userId" FROM "Wallet"
       WHERE "userId" IN (${sender}, ${receiver})
       ORDER BY "userId" ASC
       FOR UPDATE
     `;
 
-    if (!lockedRows.some((row) => row.userId === receiver)) {
-      throw new NotFoundError("receiver's wallet could not be found");
-    }
+  if (!lockedRows.some((row) => row.userId === receiver)) {
+    throw new NotFoundError("receiver's wallet could not be found");
+  }
 
-    const senderWallet = await txn.wallet.findUnique({
-      where: { userId: sender },
-      select: { balance: true },
-    });
-    if (!senderWallet) {
-      throw new NotFoundError("sender's wallet could not be found");
-    }
-    if (amt.comparedTo(senderWallet.balance) > 0) {
-      throw new InsufficientFundsError("insufficient funds to send money");
-    }
+  const senderWallet = await txn.wallet.findUnique({
+    where: { userId: sender },
+    select: { balance: true },
+  });
+  if (!senderWallet) {
+    throw new NotFoundError("sender's wallet could not be found");
+  }
+  if (amt.comparedTo(senderWallet.balance) > 0) {
+    throw new InsufficientFundsError("insufficient funds to send money");
+  }
 
-    await txn.wallet.update({
-      where: { userId: sender },
-      data: { balance: { decrement: amt } },
-    });
-    await txn.wallet.update({
-      where: { userId: receiver },
-      data: { balance: { increment: amt } },
-    });
+  await txn.wallet.update({
+    where: { userId: sender },
+    data: { balance: { decrement: amt } },
+  });
+  await txn.wallet.update({
+    where: { userId: receiver },
+    data: { balance: { increment: amt } },
+  });
 
-    return txn.transaction.create({
-      data: {
-        fromUserId: sender,
-        toUserId: receiver,
-        type: "P2P_TRANSFER",
-        status: "SUCCESS",
-        amount: amt,
-      },
-      include: {
-        fromUser: { select: { firstName: true, lastName: true } },
-        toUser: { select: { firstName: true, lastName: true } },
-      },
-    });
+  const transaction = await txn.transaction.create({
+    data: {
+      fromUserId: sender,
+      toUserId: receiver,
+      type: "P2P_TRANSFER",
+      status: "SUCCESS",
+      amount: amt,
+    },
+    include: {
+      fromUser: { select: { firstName: true, lastName: true } },
+      toUser: { select: { firstName: true, lastName: true } },
+    },
   });
 
   return {
     sender: `${transaction.fromUser.firstName} ${transaction.fromUser.lastName}`,
     receiver: `${transaction.toUser.firstName} ${transaction.toUser.lastName}`,
-    timestamp: transaction.createdAt,
     amount: transaction.amount,
+    timestamp: transaction.createdAt,
     status: transaction.status,
     type: transaction.type,
   };

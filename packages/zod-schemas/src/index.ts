@@ -53,6 +53,10 @@ export const paginationSchema = z.object({
     .optional(),
 });
 
+export const idempotentKeySchema = z.object({
+  idempotencykey: z.uuid(),
+});
+
 export type RegisterInputs = z.infer<typeof registerSchema>;
 export type PaginationInputs = z.infer<typeof paginationSchema>;
 export type LoginInputs = z.infer<typeof loginSchema>;

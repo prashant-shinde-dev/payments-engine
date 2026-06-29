@@ -1,6 +1,7 @@
 export class AppError extends Error {
   code: string;
   statusCode: number;
+  details?: unknown;
 
   constructor(
     code: string,
@@ -21,8 +22,9 @@ export class NotFoundError extends AppError {
 }
 
 export class ValidationError extends AppError {
-  constructor(message: string) {
+  constructor(message: string, details?: unknown) {
     super("VALIDATION_ERROR", message, 400);
+    this.details = details;
   }
 }
 

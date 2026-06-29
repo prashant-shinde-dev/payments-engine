@@ -2,10 +2,15 @@ import express, { Request, Response } from "express";
 import {
   getBalance,
   getTransactions,
-  send,
+  transferCore,
 } from "../services/wallet.service.js";
+import { runIdempotent } from "../services/idempotency.js";
 
-import { paginationSchema, transactionSchema } from "@payments/zod-schemas";
+import {
+  idempotentKeySchema,
+  paginationSchema,
+  transactionSchema,
+} from "@payments/zod-schemas";
 import { ApiResponse } from "@payments/types";
 import { validate } from "../middleware/validation.js";
 
@@ -40,7 +45,17 @@ router.get("/transactions", async (req: Request, res: Response) => {
 router.post("/transfer", async (req: Request, res: Response) => {
   const { receiver, amount } = validate(transactionSchema, req.body);
   const sender = req.user!.userId;
-  const transaction = await send({ sender, receiver, amount });
+  const { idempotencykey } = validate(idempotentKeySchema, req.headers);
+  const transaction = await runIdempotent(
+    sender,
+    idempotencykey,
+    transferCore,
+    {
+      sender,
+      receiver,
+      amount,
+    },
+  );
   res
     .status(201)
     .json({ success: true, data: transaction } satisfies ApiResponse<
