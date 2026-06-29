@@ -56,6 +56,14 @@ model Transaction {
   @@index([toUserId, createdAt])
 }
 
+model IdempotencyRecord {
+  userId   String
+  idempotencyKey    String
+  requestHash  String  // sha256 fingerprint of the request — detects key reuse
+  response String? // serialized result of the operation, replayed on a duplicate
+  @@id([userId, idempotencyKey])
+}
+
 enum TransactionType {
   P2P_TRANSFER
   BANK_DEPOSIT
