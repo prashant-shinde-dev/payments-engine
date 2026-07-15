@@ -1,47 +1,15 @@
 import "dotenv/config";
-import express, { NextFunction, Request, Response } from "express";
 import { prisma } from "@payments/db/client";
-import { router as authRouter } from "./routes/auth.routes.js";
-import { router as walletRouter } from "./routes/wallet.route.js";
-
 import { config } from "./config.js";
-import { AppError } from "./errors/index.js";
-import { authenticate } from "./middleware/auth.middleware.js";
+import { createApp } from "./app.js";
 
-const app = express();
-const PORT = config.port;
-app.use(express.json());
+const app = createApp();
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+const server = app.listen(config.port, () => {
+  console.log(`API listening on port ${config.port}`);
 });
 
-app.use("/api/v1/auth", authRouter);
-app.use("/api/v1/wallet", authenticate, walletRouter);
-
-app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
-  if (err instanceof AppError) {
-    res.status(err.statusCode).json({
-      success: false,
-      error: {
-        code: err.code,
-        message: err.message,
-        ...(err.details !== undefined ? { details: err.details } : {}),
-      },
-    });
-  } else {
-    console.error("[unhandled error]", err);
-    res.status(500).json({
-      success: false,
-      error: { code: "UNKNOWN", message: "Something Went Wrong" },
-    });
-  }
-});
-
-const server = app.listen(PORT, () => {
-  console.log(`app running on ${PORT}`);
-});
-const shutdown = async () => {
+const shutdown = async (): Promise<void> => {
   server.close();
   await prisma.$disconnect();
   process.exit(0);
