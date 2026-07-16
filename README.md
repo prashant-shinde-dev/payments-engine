@@ -1,5 +1,7 @@
 # Payments Engine
 
+[![CI Pipeline](https://github.com/prashant-shinde-dev/payments-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/prashant-shinde-dev/payments-engine/actions/workflows/ci.yml)
+
 A production-grade payments engine for moving money between accounts,
 with correctness, atomicity, and auditability as first-class concerns.
 
@@ -9,26 +11,44 @@ with correctness, atomicity, and auditability as first-class concerns.
 
 **Idempotent payment processing**
 Duplicate requests (network retries, double-clicks) are detected and
-short-circuited before they execute. Same request, same result, every time.
+short-circuited before they execute — same request, same result, every time.
+Concurrent duplicates carrying the same key move money exactly once.
 
-**Atomic double-entry transfers**
-P2P transfers use database-level transactions with row locking.
-Either both the debit and credit happen — or neither does.
-No partial states. No overdrafts.
-
-**Async bank webhook pipeline**
-Bank operations (deposit, withdrawal) are processed asynchronously
-via a job queue with retry, exponential backoff, and dead letter handling.
-The system handles bank timeouts and failures without losing money.
+**Atomic, concurrency-safe transfers**
+P2P transfers run inside database transactions with row-level locking:
+either both the debit and credit commit, or neither does. Balances can never
+go negative, and simultaneous transfers can't overdraft or deadlock.
 
 **Typed error handling**
-Every failure mode has a typed error class. Nothing is swallowed silently.
-Errors are structured, logged, and mapped to correct HTTP status codes.
+Every failure mode has a typed error class — nothing is swallowed silently.
+Errors are structured, logged, and mapped to the correct HTTP status codes.
 
-**Schema-first validation**
-Zod schemas defined once in a shared package, used for both API validation
-(security) and frontend form validation (UX). Frontend and backend
-validation rules cannot drift.
+**Schema-first API validation**
+Zod schemas defined once in a shared package validate every request at the
+boundary, before it reaches business logic.
+
+**Continuous verification**
+Every push and pull request runs typecheck, lint, build, and an integration
+suite against a real PostgreSQL — so the guarantees above are proven on a
+clean machine, not just locally.
+
+---
+
+## Roadmap
+
+Planned, not yet built:
+
+**Double-entry ledger**
+Move from balance mutation to an append-only, double-entry ledger so every
+transfer is two balanced postings and account balances are fully auditable.
+
+**Async bank pipeline**
+Deposits and withdrawals processed asynchronously via a job queue with
+retries, exponential backoff, and dead-letter handling — resilient to bank
+timeouts and failures without losing money.
+
+**Refresh-token authentication**
+Short-lived access tokens backed by rotating refresh tokens.
 
 ---
 
@@ -55,25 +75,26 @@ API Server (Express + TypeScript)
 See [`docs/DECISIONS.md`](docs/DECISIONS.md) for full trade-off reasoning.
 
 Key decisions:
+
 - PostgreSQL over NoSQL — ACID is non-negotiable for money movement
 - `Decimal(20,2)` not `Float` — float arithmetic loses cents
 - Zod in a shared package — one schema, no FE/BE drift
-- BullMQ over Kafka — right tool for our scale, documented trade-offs
+- Pessimistic row locking for transfers — locks acquired in a stable order, so concurrent transfers can't deadlock or overdraft
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Why |
-|---|---|---|
-| Monorepo | Turborepo + npm workspaces | Shared types, no drift |
-| Backend | Express.js + TypeScript | Explicit, full control |
-| Frontend | Next.js 14 (App Router) | Industry standard |
-| Database | PostgreSQL + Prisma | ACID transactions |
-| Validation | Zod | Runtime + compile-time, shared |
-| Auth | JWT + refresh tokens | Stateless + revocable |
-| Queue | BullMQ + Redis | Retry, DLQ, async jobs |
-| Local infra | Docker + docker-compose | Reproducible, instant setup |
+| Layer       | Technology                 | Why                            |
+| ----------- | -------------------------- | ------------------------------ |
+| Monorepo    | Turborepo + npm workspaces | Shared types, no drift         |
+| Backend     | Express.js + TypeScript    | Explicit, full control         |
+| Frontend    | Next.js 14 (App Router)    | Industry standard              |
+| Database    | PostgreSQL + Prisma        | ACID transactions              |
+| Validation  | Zod                        | Runtime + compile-time, shared |
+| Auth        | JWT access tokens          | Stateless (refresh tokens planned) |
+| Queue       | BullMQ + Redis (planned)   | Retry, DLQ, async jobs         |
+| Local infra | Docker + docker-compose    | Reproducible, instant setup    |
 
 ---
 
@@ -83,7 +104,7 @@ Key decisions:
 
 ```bash
 # 1. Clone
-git clone https://github.com/prashantshinde/payments-engine
+git clone https://github.com/prashant-shinde-dev/payments-engine
 cd payments-engine
 
 # 2. Start infrastructure
@@ -113,11 +134,11 @@ Web runs on `http://localhost:3000`
 ### Auth
 
 ```
-POST /auth/register
+POST /api/v1/auth/register
   Body: { firstName, lastName, email, phoneNumber, password }
   Returns: { token, user }
 
-POST /auth/login
+POST /api/v1/auth/login
   Body: { email, password }
   Returns: { token, user }
 ```
@@ -125,29 +146,30 @@ POST /auth/login
 ### Wallet
 
 ```
-GET  /wallet/balance
+GET  /api/v1/wallet/balance
   Auth: Bearer token
-  Returns: { balance, currency }
+  Returns: { balance }
 
-POST /wallet/transfer
-  Auth: Bearer token
-  Body: { receiverId, amount, note? }
-  Returns: { transactionId, newBalance, timestamp }
+POST /api/v1/wallet/transfer
+  Auth: Bearer token — the sender is taken from the token, never the body
+  Header: Idempotency-Key
+  Body: { receiver, amount }
+  Returns: { sender, receiver, amount, timestamp, status, type }
 
-GET  /wallet/transactions?page=1&limit=20
+GET  /api/v1/wallet/transactions?page=1&pageSize=20
   Auth: Bearer token
-  Returns: { transactions[], total, page, limit }
+  Returns: { transactions, total }
 ```
 
 ---
 
 ## Project Status
 
-| Layer | Description | Status |
-|---|---|---|
-| Layer 1 | Core functionality — auth, wallet, P2P transfer | Complete |
+| Layer   | Description                                                   | Status      |
+| ------- | ------------------------------------------------------------- | ----------- |
+| Layer 1 | Core functionality — auth, wallet, P2P transfer               | Complete    |
 | Layer 2 | Correctness under pressure — idempotency, locking, async bank | In Progress |
-| Layer 3 | Scale — CQRS, fraud detection, reconciliation | Upcoming |
+| Layer 3 | Scale — CQRS, fraud detection, reconciliation                 | Upcoming    |
 
 ---
 
@@ -162,4 +184,4 @@ This project follows a professional engineering workflow:
 
 ---
 
-*Built by Prashant Shinde*
+_Built by Prashant Shinde_
