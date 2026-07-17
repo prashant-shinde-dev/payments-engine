@@ -57,11 +57,13 @@ model Transaction {
 }
 
 model IdempotencyRecord {
-  userId   String
-  idempotencyKey    String
-  requestHash  String  // sha256 fingerprint of the request — detects key reuse
-  response String? // serialized result of the operation, replayed on a duplicate
+  userId          String
+  idempotencyKey  String
+  requestHash     String  // sha256 fingerprint of the request — detects key reuse
+  response        String? // serialized result of the operation, replayed on a duplicate
   @@id([userId, idempotencyKey])
+  createdAt       DateTime @default(now())
+  @@index([createdAt])
 }
 
 enum TransactionType {
