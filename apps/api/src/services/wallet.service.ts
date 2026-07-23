@@ -3,6 +3,7 @@ import {
   prisma,
   TransactionStatus,
   TransactionType,
+  Wallet,
 } from "@payments/db/client";
 import { Decimal } from "decimal.js";
 
@@ -92,45 +93,85 @@ export async function transferCore(
   if (sender === receiver) {
     throw new ConflictError("cant send money to self");
   }
+  const [senderWallet, receiverWallet] = await lockAndFetchWallets(
+    txn,
+    sender,
+    receiver,
+  );
+  if (
+    senderWallet.accountType === "SYSTEM" ||
+    receiverWallet.accountType === "SYSTEM"
+  ) {
+    throw new NotFoundError("receiver's wallet could not be found");
+  }
+  if (amt.comparedTo(senderWallet.balance) > 0) {
+    throw new InsufficientFundsError("insufficient funds to send money");
+  }
+
+  const transaction = await postLedger(txn, {
+    to: receiverWallet,
+    from: senderWallet,
+    amt,
+  });
+  return {
+    sender: `${transaction.fromUser.firstName} ${transaction.fromUser.lastName}`,
+    receiver: `${transaction.toUser.firstName} ${transaction.toUser.lastName}`,
+    amount: transaction.amount,
+    timestamp: transaction.createdAt,
+    status: transaction.status,
+    type: transaction.type,
+  };
+}
+
+async function lockAndFetchWallets(
+  txn: Prisma.TransactionClient,
+  sender: string,
+  receiver: string,
+): Promise<[Wallet, Wallet]> {
   // Lock both wallet rows up front, ordered by the stable userId value (NOT the
   // sender/receiver role). A consistent global lock order means two opposite-
   // direction transfers can never each hold the row the other needs -> no deadlock.
   // This ORDER BY is load-bearing; do not remove it.
-  const lockedRows = await txn.$queryRaw<{ userId: string }[]>`
+  await txn.$queryRaw<{ userId: string }[]>`
       SELECT "userId" FROM "Wallet"
       WHERE "userId" IN (${sender}, ${receiver})
       ORDER BY "userId" ASC
       FOR UPDATE
     `;
 
-  if (!lockedRows.some((row) => row.userId === receiver)) {
-    throw new NotFoundError("receiver's wallet could not be found");
-  }
-
   const senderWallet = await txn.wallet.findUnique({
     where: { userId: sender },
-    select: { balance: true },
+  });
+  const receiverWallet = await txn.wallet.findUnique({
+    where: { userId: receiver },
   });
   if (!senderWallet) {
     throw new NotFoundError("sender's wallet could not be found");
   }
-  if (amt.comparedTo(senderWallet.balance) > 0) {
-    throw new InsufficientFundsError("insufficient funds to send money");
+  if (!receiverWallet) {
+    throw new NotFoundError("receiver's wallet could not be found");
   }
+  return [senderWallet, receiverWallet];
+}
 
+async function postLedger(
+  txn: Prisma.TransactionClient,
+  data: { to: Wallet; from: Wallet; amt: Decimal },
+) {
+  const { to, from, amt } = data;
   await txn.wallet.update({
-    where: { userId: sender },
+    where: { userId: from.userId },
     data: { balance: { decrement: amt } },
   });
   await txn.wallet.update({
-    where: { userId: receiver },
+    where: { userId: to.userId },
     data: { balance: { increment: amt } },
   });
 
   const transaction = await txn.transaction.create({
     data: {
-      fromUserId: sender,
-      toUserId: receiver,
+      fromUserId: from.userId,
+      toUserId: to.userId,
       type: "P2P_TRANSFER",
       status: "SUCCESS",
       amount: amt,
@@ -141,12 +182,24 @@ export async function transferCore(
     },
   });
 
-  return {
-    sender: `${transaction.fromUser.firstName} ${transaction.fromUser.lastName}`,
-    receiver: `${transaction.toUser.firstName} ${transaction.toUser.lastName}`,
-    amount: transaction.amount,
-    timestamp: transaction.createdAt,
-    status: transaction.status,
-    type: transaction.type,
-  };
+  const senderLedger = await txn.ledgerEntry.create({
+    data: {
+      transactionId: transaction.id,
+      walletId: from.id,
+      amount: amt.negated(),
+    },
+  });
+
+  const receiverLedger = await txn.ledgerEntry.create({
+    data: {
+      transactionId: transaction.id,
+      walletId: to.id,
+      amount: amt,
+    },
+  });
+
+  if (!senderLedger.amount.plus(receiverLedger.amount).isZero()) {
+    throw new ConflictError("The Ledger does not conserve");
+  }
+  return transaction;
 }

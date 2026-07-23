@@ -374,3 +374,81 @@ tracking it separately keeps each change atomic and reviewable.
 **Consequence:**
 Until the follow-up ships, a retried transfer request can double-move money. This is a
 known, documented gap — surfaced in the PR's Known Limitations — not a silent omission.
+
+---
+
+## ADR-012: Append-Only Double-Entry Ledger; Balance Derived, Not Stored
+
+**Status:** Accepted
+**Date:** Layer 2
+
+**Context:**
+Through Layer 1 and most of Layer 2, a wallet's balance was a single `Decimal` column that the
+transfer mutated in place (`decrement`/`increment`), while a separate `Transaction` row recorded
+that a transfer happened. Nothing tied the two together: a stray `UPDATE`, a bug, or a new code
+path could move the scalar without a matching movement, and the balance could not answer the one
+question a payments system must answer on demand — *"prove why this balance is €41.50."* The
+balance was an opinion with no evidence: it stored the result of a computation and discarded the
+inputs, so it could not be audited, reconstructed, or reconciled, and there was nowhere clean to
+represent the PENDING money the async bank flow (#010) needs. This was the last open Layer-1
+known limitation ("balance as scalar, not ledger").
+
+**Decision:**
+Money movement is recorded as an **append-only, double-entry ledger**. Each movement writes one
+immutable **leg per account** it touches (`LedgerEntry`: `walletId`, signed `amount`,
+`transactionId`), and a wallet's balance is **defined as `SUM(legs)`**. The `Wallet.balance`
+scalar is retained only as an O(1) **projection** of that sum. Specifically:
+
+- **Per-account signed legs.** A transfer of X writes two legs — sender `−X`, receiver `+X`.
+  Direction is the sign, so both invariants (a movement's legs sum to zero; balance = sum of an
+  account's legs) are a single `SUM` with no `CASE` branching. Non-negativity therefore lives on
+  the *balance*, never the leg (a debit leg is legitimately negative).
+- **House/system account.** External and opening-balance movements are balanced against a
+  system-owned house account, so *every* movement sums to zero with no exceptions. The house is a
+  first-class account distinguished by `accountType` (`CUSTOMER | SYSTEM`); the customer-protecting
+  invariants (non-negative-balance CHECK, overdraft guard, authentication) **allowlist `CUSTOMER`**,
+  so the house may go negative (its balance mirrors the system's float/liability) and can never
+  authenticate. New account kinds are safe by default.
+- **Projection written atomically.** The cached `Wallet.balance` is updated in the same
+  `$transaction` as the legs, inside the existing `SELECT … FOR UPDATE` lock (ADR-010), so it can
+  never drift from `SUM(legs)`.
+- **Immutability enforced at the database.** A `BEFORE UPDATE OR DELETE` trigger on `LedgerEntry`
+  rejects any mutation. A trigger — not `REVOKE` — is used because the application connects as the
+  database owner/superuser, which bypasses privilege checks; a trigger binds regardless of role.
+  Corrections are expressed as new, balanced legs, never edits.
+- **Migration seeds opening balances.** Existing wallets are backfilled with one balanced
+  `house → customer` opening movement equal to each wallet's current balance, so
+  `SUM(legs) == balance` holds from the first read. The pre-ledger `Transaction` log is not
+  replayed (it never recorded opening balances and cannot be trusted to reproduce real balances).
+
+**Rationale:**
+Store the facts (immutable movements); derive the state (balance). The correct claim was never
+"the balance is X" but "the balance is X *because* of these movements." Deriving balance from an
+immutable ledger makes it **provable** (enumerate the legs), **reconstructable** (rebuild the
+scalar from `SUM(legs)` after any corruption), and **reconcilable** (assert `cache == SUM(legs)`
+now, `SUM(legs) == real escrow` later). Double-entry's "every movement sums to zero" is a
+continuous, cheap integrity check a scalar can never offer, and append-only makes the audit trail
+trustworthy — near money, the history *is* the product. None of these are possible with a stored
+scalar, no matter how correct the surrounding code is.
+
+**Consequence:**
+Correctness now rests on two documented invariants — `balance == SUM(legs)` (kept true by the
+same-transaction projection write) and *every movement's legs sum to zero* (conservation) — both
+proven by executable tests (reconstruction, conservation, large-magnitude precision, and
+DB-enforced immutability). `Wallet.balance` is now a cache: read on the hot path, rebuildable from
+the ledger, verified by reconciliation. The ledger is the substrate #010 builds PENDING money and
+saga compensation on, and the Layer-3 reconciliation job checks. A privileged system account now
+exists and must stay gated behind `accountType`, so its exemptions (negative balance, no overdraft
+check, no auth) can never leak to a customer wallet.
+
+**Trade-offs / rejected alternatives:**
+- *Stored scalar as source of truth* — rejected: unprovable, silently drifts, no home for PENDING money.
+- *Single-entry log (one row per transfer)* — rejected: cannot answer "whose balance," no counter-leg for external money.
+- *Debit/credit tag instead of a signed amount* — rejected: forces a `CASE` into every read; signed amounts keep both invariants a plain `SUM`.
+- *Nullable `transactionId` or a separate `movementId` grouping key* — rejected: house-as-system-account makes every movement a real `Transaction`, so the FK is always present and doubles as the grouping key.
+- *Replaying the old `Transaction` log at migration* — rejected: it never recorded opening balances and could rewrite real balances; seeding the current balance is provably consistent.
+- *`REVOKE UPDATE, DELETE` for immutability* — rejected: bypassed by the owner/superuser the app connects as; a trigger binds unconditionally.
+
+**Revisit when:**
+- The house's single negative balance needs to split by origin (escrow, fee, revenue, promo/equity) → add `accountType` values; the allowlist keeps new kinds safe by default.
+- `SUM(legs)` on the reconciliation path becomes a bottleneck → time-partition `LedgerEntry` or keep a periodic checkpoint (deferred; the indexed sum is sufficient now).

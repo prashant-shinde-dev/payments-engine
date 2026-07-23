@@ -3,7 +3,7 @@
 > This document describes the system as it currently exists.
 > It is rewritten as the system evolves — not appended to.
 > At any point it reads as a coherent whole, not a changelog.
-> Last updated: Layer 1
+> Last updated: Layer 2
 
 ---
 
@@ -50,6 +50,8 @@ is introduced in Layer 2 when we demonstrate the failure that requires it.
 User ──1:1──► Wallet
 User ──1:N──► Transaction  (as sender)
 User ──1:N──► Transaction  (as receiver)
+Wallet ──1:N──► LedgerEntry       (its signed legs; balance = SUM(legs))
+Transaction ──1:N──► LedgerEntry  (the balanced legs of one movement)
 ```
 
 ### Schema
@@ -71,14 +73,30 @@ model User {
 }
 
 model Wallet {
-  id        String   @id @default(uuid())
-  userId    String   @unique
-  balance   Decimal  @db.Decimal(20, 2)
-  currency  String   @default("INR")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String      @id @default(uuid())
+  userId      String      @unique
+  balance     Decimal     @db.Decimal(20, 2)  // cached projection of SUM(ledger legs)
+  currency    String      @default("INR")
+  accountType AccountType @default(CUSTOMER)   // CUSTOMER | SYSTEM (the house)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
 
-  user User @relation(fields: [userId], references: [id])
+  user   User          @relation(fields: [userId], references: [id])
+  ledger LedgerEntry[]
+}
+
+model LedgerEntry {            // append-only; a wallet's balance = SUM(amount)
+  id            String      @id @default(uuid())
+  walletId      String
+  transactionId String                          // groups the balanced legs of one movement
+  amount        Decimal     @db.Decimal(20, 2)   // signed: debit −, credit +
+  createdAt     DateTime    @default(now())
+
+  wallet      Wallet      @relation(fields: [walletId], references: [id])
+  transaction Transaction @relation(fields: [transactionId], references: [id])
+
+  @@index([walletId])
+  @@index([transactionId])
 }
 
 model Transaction {
@@ -91,8 +109,9 @@ model Transaction {
   note       String?
   createdAt  DateTime          @default(now())
 
-  fromUser User @relation("SentTransactions", fields: [fromUserId], references: [id])
-  toUser   User @relation("ReceivedTransactions", fields: [toUserId], references: [id])
+  fromUser User          @relation("SentTransactions", fields: [fromUserId], references: [id])
+  toUser   User          @relation("ReceivedTransactions", fields: [toUserId], references: [id])
+  ledger   LedgerEntry[]
 
   @@index([fromUserId, createdAt])
   @@index([toUserId, createdAt])
@@ -102,12 +121,18 @@ enum TransactionType {
   P2P_TRANSFER
   BANK_DEPOSIT
   BANK_WITHDRAWAL
+  OPENING_BALANCE
 }
 
 enum TransactionStatus {
   PENDING
   SUCCESS
   FAILED
+}
+
+enum AccountType {
+  CUSTOMER
+  SYSTEM
 }
 ```
 
@@ -125,6 +150,14 @@ UUIDs are opaque and safe to expose in URLs and API responses.
 A User without a Wallet is an invalid system state.
 Both are created inside a single Prisma `$transaction` at registration.
 If wallet creation fails, the user record is rolled back.
+
+**Balance is derived, not stored (ADR-012)**
+Every movement writes immutable, signed `LedgerEntry` legs; a wallet's balance is
+`SUM(legs)`. `Wallet.balance` is a cached projection written in the *same* transaction
+as the legs, so it can never drift. Legs are append-only — a DB trigger blocks
+`UPDATE`/`DELETE`. `accountType` marks the house/system account (the counter-leg for
+opening-balance and, later, bank movements), which is exempt from the non-negativity
+rule so it can carry the system's float.
 
 ---
 
@@ -173,8 +206,9 @@ Auth middleware: extracts senderId from JWT — never from body
   → Fetch sender wallet
   → Check balance >= amount
   → prisma.$transaction([
-      debit sender wallet,
-      credit receiver wallet,
+      lock both wallet rows (SELECT … FOR UPDATE, ordered by userId),
+      write two balanced ledger legs (sender −amount, receiver +amount),
+      update both cached balances (the projection of SUM(legs)),
       create Transaction record (status: SUCCESS)
     ])
   → Return: { transactionId, newBalance, timestamp }
@@ -189,6 +223,11 @@ Failure cases:
   SELECT … FOR UPDATE, ordered by userId, inside the transaction. Concurrent
   transfers from the same wallet can no longer overdraft, and opposite-direction
   transfers cannot deadlock. See ADR-010.
+
+✓ Double-entry (Layer 2): each transfer is two balanced ledger legs that sum to
+  zero; the wallet balance is a projection of SUM(legs), written in the same
+  transaction so it can never drift. Legs are append-only (a DB trigger blocks
+  UPDATE/DELETE), so corrections are new legs, never mutations. See ADR-012.
 ```
 
 ### GET /wallet/balance
@@ -221,7 +260,7 @@ These are intentional. Each will be demonstrated as a failure, then fixed.
 | No idempotency keys | Duplicate requests send money twice | Layer 2 |
 | No async bank processing | Timeout mid-transfer loses money | Layer 2 |
 | No refresh tokens | Stolen JWT has no revocation path | Layer 2 |
-| Balance as scalar, not ledger | Cannot audit or reconstruct history | Layer 2 |
+| Balance as scalar, not ledger | Cannot audit or reconstruct history | ✅ Fixed — ADR-012 |
 
 ---
 

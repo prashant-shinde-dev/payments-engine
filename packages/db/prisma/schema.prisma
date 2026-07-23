@@ -29,14 +29,27 @@ model User {
 }
 
 model Wallet {
-  id        String   @id @default(uuid())
-  userId    String   @unique
-  balance   Decimal  @db.Decimal(20, 2)
-  currency  String   @default("INR")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String      @id @default(uuid())
+  userId      String      @unique
+  balance     Decimal     @db.Decimal(20, 2)
+  currency    String      @default("INR")
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  accountType AccountType @default(CUSTOMER)
+  user        User        @relation(fields: [userId], references: [id])
+  ledger      LedgerEntry[]
+}
 
-  user User @relation(fields: [userId], references: [id])
+model LedgerEntry {
+  id            String      @id @default(uuid())
+  walletId      String      
+  transactionId String      
+  amount        Decimal     @db.Decimal(20, 2)
+  createdAt     DateTime    @default(now())
+  wallet        Wallet      @relation(fields: [walletId], references: [id])
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  @@index([walletId])
+  @@index([transactionId])
 }
 
 model Transaction {
@@ -48,7 +61,7 @@ model Transaction {
   status     TransactionStatus
   note       String?
   createdAt  DateTime          @default(now())
-
+  ledger     LedgerEntry[]
   fromUser User @relation("SentTransactions", fields: [fromUserId], references: [id])
   toUser   User @relation("ReceivedTransactions", fields: [toUserId], references: [id])
 
@@ -70,10 +83,16 @@ enum TransactionType {
   P2P_TRANSFER
   BANK_DEPOSIT
   BANK_WITHDRAWAL
+  OPENING_BALANCE
 }
 
 enum TransactionStatus {
   PENDING
   SUCCESS
   FAILED
+}
+
+enum AccountType {
+  CUSTOMER
+  SYSTEM
 }
