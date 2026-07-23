@@ -2,8 +2,25 @@
 
 [![CI Pipeline](https://github.com/prashant-shinde-dev/payments-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/prashant-shinde-dev/payments-engine/actions/workflows/ci.yml)
 
-A production-grade payments engine for moving money between accounts,
-with correctness, atomicity, and auditability as first-class concerns.
+A study in **payment correctness** — money that moves exactly once under
+concurrency, retries, and partial failure. The domain is deliberate: money is
+the least forgiving place to get correctness wrong. This isn't a wallet
+*product* (real-time bank rails already own consumer P2P) — it's the engineering
+underneath one: the ledger, locking, and idempotency primitives that
+marketplaces, escrow, and BNPL are built on.
+
+---
+
+## Where to Look First
+
+If you're reviewing this as an engineer, the signal is concentrated in a few places:
+
+- **Concurrency-safe transfers** — `apps/api/src/services/wallet.service.ts` + ADR-010.
+  Both wallet rows are locked in a stable order, so concurrent transfers can't overdraft or deadlock.
+- **Exactly-once money movement** — the idempotency layer (`apps/api/src/services/idempotency.ts`)
+  and its bounded-retention reaper: duplicates move money once, and the record store stays bounded.
+- **Trade-off reasoning** — [`docs/DECISIONS.md`](docs/DECISIONS.md). Each ADR argues the call —
+  including the ones deliberately *deferred* or *rejected*. Knowing when **not** to build is the point.
 
 ---
 
@@ -169,7 +186,7 @@ GET  /api/v1/wallet/transactions?page=1&pageSize=20
 | ------- | ------------------------------------------------------------- | ----------- |
 | Layer 1 | Core functionality — auth, wallet, P2P transfer               | Complete    |
 | Layer 2 | Correctness under pressure — idempotency, locking, async bank | In Progress |
-| Layer 3 | Scale — CQRS, fraud detection, reconciliation                 | Upcoming    |
+| Layer 3 | Reconciliation, observability, and failure-mode hardening     | Upcoming    |
 
 ---
 

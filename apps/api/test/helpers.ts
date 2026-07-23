@@ -1,8 +1,9 @@
 import request from "supertest";
 import { randomUUID } from "node:crypto";
-import { prisma } from "@payments/db/client";
+import { HOUSE_USER_ID, HOUSE_WALLET_ID, prisma } from "@payments/db/client";
 import { createApp } from "../src/app.js";
 import type { SafeUser } from "@payments/types";
+import Decimal from "decimal.js";
 
 /**
  * One shared in-process app for the whole suite. Supertest drives it directly —
@@ -58,18 +59,53 @@ export function authHeader(token: string): { Authorization: string } {
   return { Authorization: `Bearer ${token}` };
 }
 
-/**
- * Direct DB write — the ONLY sanctioned one in the suite. There is no deposit
- * endpoint yet (it arrives with the async bank flow), so wallets are funded by
- * writing the balance straight to the row. `amount` is a decimal string to stay
- * off floating point.
- */
+// Funds a wallet as a balanced house->user opening movement so SUM(legs) matches the
+// cached balance. TODO(#010): route through postLedger once it takes a type param.
 export async function fundWallet(
   userId: string,
   amount: string,
 ): Promise<void> {
-  await prisma.wallet.update({
-    where: { userId },
-    data: { balance: amount },
+  const amt = new Decimal(amount);
+  await prisma.$transaction(async (txn) => {
+    const userWallet = await txn.wallet.update({
+      where: { userId },
+      data: { balance: { increment: amt } },
+    });
+    await txn.wallet.update({
+      where: { id: HOUSE_WALLET_ID },
+      data: { balance: { decrement: amt } },
+    });
+    const transaction = await txn.transaction.create({
+      data: {
+        fromUserId: HOUSE_USER_ID,
+        toUserId: userId,
+        amount: amt,
+        type: "OPENING_BALANCE",
+        status: "SUCCESS",
+      },
+    });
+    await txn.ledgerEntry.create({
+      data: {
+        walletId: userWallet.id,
+        transactionId: transaction.id,
+        amount: amt,
+      },
+    });
+    await txn.ledgerEntry.create({
+      data: {
+        walletId: HOUSE_WALLET_ID,
+        transactionId: transaction.id,
+        amount: amt.negated(),
+      },
+    });
   });
+}
+
+// SUM of a wallet's legs; Decimal(0) when it has none.
+export async function deriveBalance(walletId: string): Promise<Decimal> {
+  const { _sum } = await prisma.ledgerEntry.aggregate({
+    where: { walletId },
+    _sum: { amount: true },
+  });
+  return new Decimal(_sum.amount?.toString() ?? "0");
 }
