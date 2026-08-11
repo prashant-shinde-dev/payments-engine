@@ -15,6 +15,8 @@ export type {
   TransactionStatus,
   TransactionType,
   Wallet,
+  Transaction,
+  TransactionOutbox,
 } from "./generated/prisma/client.js";
 
 export { Prisma } from "./generated/prisma/client.js";
