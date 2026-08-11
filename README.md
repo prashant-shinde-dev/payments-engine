@@ -19,6 +19,9 @@ If you're reviewing this as an engineer, the signal is concentrated in a few pla
   Both wallet rows are locked in a stable order, so concurrent transfers can't overdraft or deadlock.
 - **Exactly-once money movement** — the idempotency layer (`apps/api/src/services/idempotency.ts`)
   and its bounded-retention reaper: duplicates move money once, and the record store stays bounded.
+- **The dual-write problem** — `apps/api/src/outbox/` + ADR-013. A committed transfer must also
+  tell a queue, and the two stores share no commit. The intent is written as a row in the *same*
+  transaction, then relayed publish-then-mark, so a crash re-delivers instead of losing.
 - **Trade-off reasoning** — [`docs/DECISIONS.md`](docs/DECISIONS.md). Each ADR argues the call —
   including the ones deliberately *deferred* or *rejected*. Knowing when **not** to build is the point.
 
@@ -35,6 +38,18 @@ Concurrent duplicates carrying the same key move money exactly once.
 P2P transfers run inside database transactions with row-level locking:
 either both the debit and credit commit, or neither does. Balances can never
 go negative, and simultaneous transfers can't overdraft or deadlock.
+
+**Append-only double-entry ledger**
+Every movement writes immutable, signed legs that sum to zero; a wallet's balance is
+`SUM(legs)`, not a number someone remembered to update. Corrections are new legs —
+history is never rewritten.
+
+**Transactional outbox**
+Work that leaves the request (a bank call) is handed to a queue through Postgres, not
+around it: the "publish this" intent commits atomically with the money, a relay claims
+rows with `FOR UPDATE SKIP LOCKED` and publishes before marking, and the consumer
+de-duplicates on the event id under a database key. Delivery is at-least-once by design;
+duplicates produce no second effect.
 
 **Typed error handling**
 Every failure mode has a typed error class — nothing is swallowed silently.
@@ -55,14 +70,10 @@ clean machine, not just locally.
 
 Planned, not yet built:
 
-**Double-entry ledger**
-Move from balance mutation to an append-only, double-entry ledger so every
-transfer is two balanced postings and account balances are fully auditable.
-
-**Async bank pipeline**
-Deposits and withdrawals processed asynchronously via a job queue with
-retries, exponential backoff, and dead-letter handling — resilient to bank
-timeouts and failures without losing money.
+**Async bank settlement**
+Bank deposits and withdrawals currently commit as `PENDING` and are handed to the
+worker; the bank call itself, its outbound idempotency key, the settlement callback,
+and reconciliation of in-doubt requests are not built yet.
 
 **Refresh-token authentication**
 Short-lived access tokens backed by rotating refresh tokens.
@@ -81,8 +92,12 @@ API Server (Express + TypeScript)
     ├── Input Validation (Zod)
     ├── AuthService
     └── WalletService
-         │
+         │  one transaction: ledger legs + outbox row
     PostgreSQL (via Prisma)
+         │  claim (SKIP LOCKED) + LISTEN/NOTIFY
+    Outbox Relay ──► BullMQ / Redis ──► Bank Worker
+                                            │  dedup key
+                                       PostgreSQL
 ```
 
 ---
@@ -97,6 +112,8 @@ Key decisions:
 - `Decimal(20,2)` not `Float` — float arithmetic loses cents
 - Zod in a shared package — one schema, no FE/BE drift
 - Pessimistic row locking for transfers — locks acquired in a stable order, so concurrent transfers can't deadlock or overdraft
+- Balance derived from an append-only ledger — the facts are stored, the state is computed
+- Transactional outbox over CDC or a table-as-queue — one write plus a relay, keeping BullMQ's retry/backoff/DLQ
 
 ---
 
@@ -110,7 +127,7 @@ Key decisions:
 | Database    | PostgreSQL + Prisma        | ACID transactions              |
 | Validation  | Zod                        | Runtime + compile-time, shared |
 | Auth        | JWT access tokens          | Stateless (refresh tokens planned) |
-| Queue       | BullMQ + Redis (planned)   | Retry, DLQ, async jobs         |
+| Queue       | BullMQ + Redis             | Retry, backoff, DLQ, async jobs |
 | Local infra | Docker + docker-compose    | Reproducible, instant setup    |
 
 ---
@@ -139,6 +156,11 @@ npm run db:migrate
 
 # 6. Start development
 npm run dev
+
+# 7. In separate terminals — the outbox pipeline (optional; the API works without
+#    them, events just queue up as PENDING until the relay runs)
+npm run dev:relay  --workspace=@payments/api
+npm run dev:worker --workspace=@payments/api
 ```
 
 API runs on `http://localhost:3001`
@@ -172,6 +194,14 @@ POST /api/v1/wallet/transfer
   Header: Idempotency-Key
   Body: { receiver, amount }
   Returns: { sender, receiver, amount, timestamp, status, type }
+
+POST /api/v1/wallet/banktransfer
+  Auth: Bearer token — the account is taken from the token, never the body
+  Header: Idempotency-Key
+  Body: { direction: "deposit" | "withdrawal", amount }
+  Returns: { sender, receiver, amount, timestamp, status: "PENDING", type }
+  Commits the movement and its outbox row in one transaction; the relay
+  publishes it to the worker out of band.
 
 GET  /api/v1/wallet/transactions?page=1&pageSize=20
   Auth: Bearer token

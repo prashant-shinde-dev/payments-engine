@@ -268,7 +268,7 @@ is a working system — not optimising the toolchain. pnpm's advantages
 
 ## ADR-009: BullMQ + Redis for Job Queue (Layer 2 — Pre-recorded)
 
-**Status:** Pending — decision pre-recorded before implementation
+**Status:** Accepted — implemented in Layer 2; the transactional handoff into it is ADR-013
 **Date:** Pre-Layer 2
 
 **Context:**
@@ -452,3 +452,195 @@ check, no auth) can never leak to a customer wallet.
 **Revisit when:**
 - The house's single negative balance needs to split by origin (escrow, fee, revenue, promo/equity) → add `accountType` values; the allowlist keeps new kinds safe by default.
 - `SUM(legs)` on the reconciliation path becomes a bottleneck → time-partition `LedgerEntry` or keep a periodic checkpoint (deferred; the indexed sum is sufficient now).
+
+---
+
+## ADR-013: Transactional Outbox for the Dual-Write Problem
+
+**Status:** Accepted
+**Date:** Layer 2
+
+**Context:**
+Every correctness guarantee in the engine so far — deterministic lock ordering (ADR-010),
+idempotent transfers (ADR-011's successor), the derived ledger (ADR-012) — held because every write
+landed in one PostgreSQL transaction, so "all or nothing" was free. The async bank flow breaks that:
+a committed transfer must also tell a second system (a BullMQ queue on Redis) to do work. Two stores,
+no shared commit.
+
+There is no ordering of those two writes that is safe. Commit first and enqueue after: a crash in
+between leaves money moved and the job gone, with nothing in the system recording that it was owed.
+Enqueue first (or inside the transaction): a rollback leaves a job for a transfer that never
+happened, and the worker faithfully acts on a phantom. This is the **dual-write problem**, and it is
+what every "just `await` both" instinct walks into.
+
+**Options Considered:**
+
+| Option | Pro | Con |
+|---|---|---|
+| `await` both writes in sequence | Trivial | Loses events in the crash window; the loss is silent and unrecoverable |
+| `queue.add` inside the `$transaction` | Feels atomic | It isn't — Redis cannot participate in a Postgres commit; a rollback cannot un-send a job |
+| Two-phase commit (XA) | Genuinely atomic | Requires a coordinator, blocks on coordinator failure, unsupported by Redis; nobody reaches for this in production |
+| CDC / transaction-log tailing (Debezium) | No producer changes; the log is already the truth | Kafka Connect + a broker + connector ops for one queue hop; operationally heavier than the entire engine |
+| Outbox table *as* the queue (pg-boss style) | One store, no relay, no Redis | Forfeits BullMQ's retry/backoff/delay/concurrency/DLQ machinery — all of which would be rebuilt by hand, worse |
+| **Transactional outbox + relay** | Collapses the dual write into one write plus an at-least-once pump | Delivery becomes at-least-once, so the consumer must be idempotent; one more process to run |
+
+**Decision:** Transactional outbox with a separate relay process.
+
+- **Producer.** `bankTransfer` inserts one `TransactionOutbox` row **inside the same `$transaction`**
+  as the ledger legs. One commit means *money moved* **and** *event owed*, atomically. There is no
+  `queue.add` anywhere in the request path.
+- **Relay.** A long-running process claims pending rows with
+  `SELECT … WHERE "publishStatus" = 'PENDING' AND "nextAttemptAt" <= now() ORDER BY "createdAt"
+  FOR UPDATE SKIP LOCKED LIMIT 200`. `SKIP LOCKED` is the multi-instance claim — ADR-010's primitive
+  with the opposite requirement: there a second writer had to *wait*, here it must *skip*, so N relays
+  partition the backlog instead of serializing or double-publishing. The claim is decided by the
+  database; there is no application-level coordination.
+- **Publish-then-mark.** `queue.add` runs first, the `publishStatus` flip second, both inside the
+  relay's transaction. The crash gap between them cannot be removed, only pointed: publish-then-mark
+  fails toward *re-delivery* (benign — the consumer dedupes), mark-then-publish fails toward *loss*
+  (a row marked done that nobody ever received, silent forever).
+- **Phase separation.** All `queue.add` calls run first (Redis only), then all outcome writes run in
+  bulk (SQL only). No savepoints: the only fallible per-row step touches a different connection
+  entirely, so a failed row leaves no partial DB state to unwind, and 200 subtransactions per batch
+  never exist. The standing rule this produced: *never let a fallible foreign call and a SQL write
+  share a `try` block* — catching a SQL error inside a transaction turns the following `COMMIT` into a
+  `ROLLBACK` that Postgres reports as success.
+- **Poison termination.** Row-attributable publish failures increment `attempts` and set an
+  exponential `nextAttemptAt` (5s → 25s → 2m → 10m cap); at 5 attempts the row becomes `FAILED` —
+  visible and re-drivable, never deleted, and never head-of-line-blocking the rows behind it.
+  Infrastructure failures are classified as *transient*, rethrown, and burn no attempts, because a
+  Redis blip fails every row identically and would otherwise mark the whole backlog `FAILED` in 25s.
+- **Wake-up.** A statement-level `AFTER INSERT` trigger issues `NOTIFY outbox_notification`; the relay
+  holds a dedicated `LISTEN` connection. NOTIFY is part of the producer's transaction (delivered on
+  commit, discarded on rollback) and carries no payload — it means "go look", never "here is a row" —
+  so it is not a second dual write. Delivery is best-effort, which is why the 5s fallback poll stays.
+- **Consumer.** Idempotent on the outbox row id, decided by the database: an
+  `IdempotencyJobRecord { eventId @id }` insert with `ON CONFLICT DO NOTHING`. A redelivery finds the
+  key taken and returns without repeating the effect.
+
+**Rationale:**
+You never need the state change and the external effect to be atomic. You need the *intent to
+publish* to be atomic with the state — which is free, because it is the same database — plus an
+at-least-once pump and an idempotent sink. Exactly-once **delivery** is a distributed-systems
+mirage; every durable pipeline worth respecting (Kafka, SQS, Stripe's webhooks) is at-least-once and
+pushes dedup onto the consumer. So exactly-once **effect** is engineered instead, from three
+properties that are each individually provable: atomic intent, a DB-decided claim with
+publish-then-mark ordering, and DB-decided consumer dedup.
+
+The outbox does not replace BullMQ and is not a queue. It is the **transactional handoff into**
+BullMQ (ADR-009), which keeps retry, backoff, delayed jobs, concurrency limits, and the dead-letter
+set. Rebuilding those on a polled table is the pg-boss option above, rejected on exactly that basis.
+
+**Trade-offs:**
+- Delivery is at-least-once by construction; a consumer that is not idempotent is a bug, not a
+  configuration choice.
+- Two dedup layers with different strengths: BullMQ's `jobId` collapse is cheap but bounded (it lapses
+  the moment a completed job is evicted, and never covers a stall-redelivery), so the authoritative
+  guard is always the consumer's database constraint.
+- A relay is a process that must be run and watched. Nothing publishes if it is down — events simply
+  accumulate as `PENDING`, which is the safe direction, but it is now a thing that can be down.
+- Latency is a notification hop plus a claim, not an in-request enqueue. For a bank call settled
+  asynchronously anyway, this costs nothing.
+- **Known limitation:** the consumer claims before it acts, so a crash between the claim and the
+  effect loses that effect. Deliberate — see ADR-015.
+
+**Revisit when:**
+- A second, unrelated consumer needs the same events → the payload shape and ADR-014's command style
+  are what change, not this mechanism.
+- Outbox volume makes a polled claim hot → partition `TransactionOutbox` by `publishStatus` or move
+  published rows to an archive table; the claim's index already covers the pending set.
+- The engine grows a second service that must react to money movement → re-evaluate CDC, which starts
+  paying for its operational weight once the number of consumers exceeds one.
+
+---
+
+## ADR-014: Command-Style Outbox with a Single Consumer, Not Event Fan-Out
+
+**Status:** Accepted
+**Date:** Layer 2
+
+**Context:**
+An outbox can carry two different things. **Event style**: past-tense facts about an aggregate
+(`transfer.completed`, `transfer.reversed`), many per transaction, published for whoever cares —
+notifications, analytics, fraud scoring. **Command style**: one "perform this operation" row per
+transaction, addressed to exactly one owner. The choice determines the table shape, the dedup
+identity, and how much surface the system grows.
+
+**Options Considered:**
+
+| Option | Pro | Con |
+|---|---|---|
+| Event style + fan-out consumers | Extensible, decoupled, demonstrates an event-driven architecture | BullMQ is a work queue (one job → one worker), not a broker; fan-out would want Kafka/RabbitMQ. Adds consumers with no behaviour to prove |
+| **Command style, 1:1 with the transaction** | Matches the actual requirement (one owner: call the bank), DB-enforceable 1:1, fits BullMQ exactly | A second lifecycle event per transaction needs a schema change |
+
+**Decision:** Command style. One outbox row per transaction, enforced by `transactionId @unique`.
+
+**Rationale:**
+The async work has a single owner — call the bank — which is a work-queue shape, and BullMQ is a work
+queue. Building notification/analytics/fraud consumers would add components without adding a
+correctness claim; the reviewer this repo is written for probes whether money moves exactly once
+under failure, not how many boxes the diagram has. *More surface area is not more senior.* The depth
+this buys instead — reconciliation, failure injection, observability — is where the remaining
+correctness story lives.
+
+Recording the rejection is the point: the event-driven fan-out is a design this system could adopt,
+described here, and deliberately not built.
+
+**Trade-offs:**
+Settlement is a *status update* on the transaction rather than a new event, and a refund is a
+separate transaction with its own row. The 1:1 invariant is enforced by the database, so the day a
+transaction legitimately needs to emit two events, the constraint fails loudly rather than silently
+producing a half-correct history — a schema change and a migration, not a data-corruption incident.
+Note that consumer dedup deliberately does **not** depend on this 1:1: it keys on the outbox row id,
+which stays correct if the invariant is ever lifted.
+
+**Revisit when:**
+- A second independent consumer needs the same facts → flip to event style and re-evaluate the broker
+  (ADR-009's revisit conditions), because BullMQ is the wrong tool for real fan-out.
+- A transaction needs to emit more than one lifecycle event → drop `transactionId @unique` and add an
+  event `type` to the identity.
+
+---
+
+## ADR-015: The Consumer Claims Before It Acts (At-Most-Once at the Bank Boundary)
+
+**Status:** Accepted — the gap it documents is closed by the async bank flow's outbound idempotency key
+**Date:** Layer 2
+
+**Context:**
+The consumer does two things: record that it handled the event (the dedup claim) and perform the
+effect (eventually, the bank call). They are two writes to two systems, so the same crash gap the
+outbox exists to manage reappears one boundary further out — and again it cannot be removed, only
+pointed.
+
+**Options Considered:**
+
+| Option | Fails toward | Consequence of the failure |
+|---|---|---|
+| Act, then claim | At-least-once | The effect ran, no key was recorded; a redelivery repeats it — the customer is debited twice |
+| **Claim, then act** | At-most-once | The key is recorded, the effect never ran; a redelivery finds the key and skips — the payment is silently missed |
+
+**Decision:** Claim first, then act.
+
+**Rationale:**
+ADR-013's rule ("order the writes so the surviving failure is the safe one") applied to a sink with
+different properties. The relay could prefer re-delivery because its sink — this consumer — is
+idempotent and absorbs a duplicate for free. The bank is **not** idempotent. A duplicate there is
+customer money moved twice: immediately visible, and unwindable only by a compensating reversal. A
+missed payment is invisible to the customer and recoverable by reconciliation, which this system is
+going to have anyway. Near money, prefer the recoverable failure.
+
+**Trade-offs:**
+Exactly-once *effect* is **not** claimed at this boundary, and this is stated rather than hidden: the
+outbox delivers at-most-once effect with no duplicates. A secondary consequence is that BullMQ's
+consumer-side `attempts` only protect failures *before* the claim commits — an effect that throws is
+not retried, because the retry finds its own claim already recorded.
+
+**Revisit when:**
+The async bank flow lands: an **outbound** `Idempotency-Key` on the bank call makes a retry return the
+original result instead of paying twice, at which point the trade-off dissolves and the shape becomes
+a request-state machine — record `PENDING` + the key *before* the call, call, record the outcome
+*after*. A crash then leaves an in-doubt row that reconciliation re-drives with the *same* key, and
+`IdempotencyJobRecord` grows from a boolean "seen" into a status record. (An idempotent *inbound*
+webhook handler dedupes the bank's callbacks to us and is also required — it does nothing about our
+own duplicate outbound call. Only the outbound key does.)
