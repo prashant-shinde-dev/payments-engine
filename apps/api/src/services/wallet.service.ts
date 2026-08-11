@@ -1,10 +1,12 @@
 import {
+  HOUSE_USER_ID,
   Prisma,
   prisma,
   TransactionStatus,
   TransactionType,
   Wallet,
 } from "@payments/db/client";
+import type { BankTransferInputs as ValidatedBankTransfer } from "@payments/zod-schemas";
 import { Decimal } from "decimal.js";
 
 import {
@@ -33,6 +35,9 @@ type TransferInputs = {
   receiver: string;
   amount: string;
 };
+
+type BankTransferInputs = ValidatedBankTransfer & { user: string };
+
 type TransferResult = {
   sender: string;
   receiver: string;
@@ -40,6 +45,26 @@ type TransferResult = {
   timestamp: Date;
   status: TransactionStatus;
   type: TransactionType;
+};
+
+type TransactionResult = {
+  fromUser: {
+    firstName: string;
+    lastName: string;
+  };
+  toUser: {
+    firstName: string;
+    lastName: string;
+  };
+} & {
+  id: string;
+  amount: Decimal;
+  type: TransactionType;
+  status: TransactionStatus;
+  note: string | null;
+  createdAt: Date;
+  fromUserId: string;
+  toUserId: string;
 };
 
 export async function getBalance(
@@ -83,6 +108,50 @@ export async function send(data: TransferInputs): Promise<TransferResult> {
   return transaction;
 }
 
+export async function bankTransfer(
+  txn: Prisma.TransactionClient,
+  data: BankTransferInputs,
+): Promise<TransferResult> {
+  const { user, amount, direction } = data;
+  const amt = new Decimal(amount);
+
+  // The house is the counter-account for money crossing the system boundary, so a
+  // deposit and a withdrawal are the same posting with the roles swapped.
+  const isDeposit = direction === "deposit";
+  const sender = isDeposit ? HOUSE_USER_ID : user;
+  const receiver = isDeposit ? user : HOUSE_USER_ID;
+  const type: TransactionType = isDeposit ? "BANK_DEPOSIT" : "BANK_WITHDRAWAL";
+  const status: TransactionStatus = "PENDING";
+
+  const [senderWallet, receiverWallet] = await lockAndFetchWallets(txn, {
+    sender,
+    receiver,
+  });
+  if (
+    senderWallet.accountType === "CUSTOMER" &&
+    amt.comparedTo(senderWallet.balance) > 0
+  ) {
+    throw new InsufficientFundsError("insufficient funds to send money");
+  }
+  const transaction = await postLedger(txn, {
+    to: receiverWallet,
+    from: senderWallet,
+    amt,
+    type,
+    status,
+  });
+
+  await writeOutbox(txn, {
+    transactionId: transaction.id,
+    type,
+    status,
+    userId: user,
+    amount: amt,
+  });
+
+  return buildResult(transaction);
+}
+
 export async function transferCore(
   txn: Prisma.TransactionClient,
   data: TransferInputs,
@@ -93,11 +162,10 @@ export async function transferCore(
   if (sender === receiver) {
     throw new ConflictError("cant send money to self");
   }
-  const [senderWallet, receiverWallet] = await lockAndFetchWallets(
-    txn,
+  const [senderWallet, receiverWallet] = await lockAndFetchWallets(txn, {
     sender,
     receiver,
-  );
+  });
   if (
     senderWallet.accountType === "SYSTEM" ||
     receiverWallet.accountType === "SYSTEM"
@@ -112,7 +180,14 @@ export async function transferCore(
     to: receiverWallet,
     from: senderWallet,
     amt,
+    type: "P2P_TRANSFER",
+    status: "SUCCESS",
   });
+
+  return buildResult(transaction);
+}
+
+function buildResult(transaction: TransactionResult): TransferResult {
   return {
     sender: `${transaction.fromUser.firstName} ${transaction.fromUser.lastName}`,
     receiver: `${transaction.toUser.firstName} ${transaction.toUser.lastName}`,
@@ -125,9 +200,9 @@ export async function transferCore(
 
 async function lockAndFetchWallets(
   txn: Prisma.TransactionClient,
-  sender: string,
-  receiver: string,
+  data: { sender: string; receiver: string },
 ): Promise<[Wallet, Wallet]> {
+  const { sender, receiver } = data;
   // Lock both wallet rows up front, ordered by the stable userId value (NOT the
   // sender/receiver role). A consistent global lock order means two opposite-
   // direction transfers can never each hold the row the other needs -> no deadlock.
@@ -156,24 +231,32 @@ async function lockAndFetchWallets(
 
 async function postLedger(
   txn: Prisma.TransactionClient,
-  data: { to: Wallet; from: Wallet; amt: Decimal },
-) {
-  const { to, from, amt } = data;
-  await txn.wallet.update({
-    where: { userId: from.userId },
-    data: { balance: { decrement: amt } },
-  });
-  await txn.wallet.update({
-    where: { userId: to.userId },
-    data: { balance: { increment: amt } },
-  });
+  data: {
+    to: Wallet;
+    from: Wallet;
+    amt: Decimal;
+    type: TransactionType;
+    status: TransactionStatus;
+  },
+): Promise<TransactionResult> {
+  const { to, from, amt, type, status } = data;
+  if (type === "P2P_TRANSFER") {
+    await txn.wallet.update({
+      where: { userId: from.userId },
+      data: { balance: { decrement: amt } },
+    });
+    await txn.wallet.update({
+      where: { userId: to.userId },
+      data: { balance: { increment: amt } },
+    });
+  }
 
   const transaction = await txn.transaction.create({
     data: {
       fromUserId: from.userId,
       toUserId: to.userId,
-      type: "P2P_TRANSFER",
-      status: "SUCCESS",
+      type,
+      status,
       amount: amt,
     },
     include: {
@@ -202,4 +285,26 @@ async function postLedger(
     throw new ConflictError("The Ledger does not conserve");
   }
   return transaction;
+}
+
+async function writeOutbox(
+  txn: Prisma.TransactionClient,
+  data: {
+    transactionId: string;
+    type: TransactionType;
+    status: TransactionStatus;
+    userId: string;
+    amount: Decimal;
+  },
+): Promise<void> {
+  const { transactionId, type, status, userId, amount } = data;
+  await txn.transactionOutbox.create({
+    data: {
+      transactionId,
+      type,
+      status,
+      userId,
+      amount,
+    },
+  });
 }

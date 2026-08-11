@@ -1,5 +1,19 @@
 import z from "zod";
 
+const amountSchema = z
+  .string()
+  .regex(/^(?:[1-9]\d{0,17}|(?:[1-9]\d{0,17}|0)\.\d{1,2})$/, {
+    message: "please provide a valid amount",
+  })
+  .refine(
+    (val) => {
+      if (val === "0.00" || val === "0.0") {
+        return false;
+      }
+      return true;
+    },
+    { message: "the transfer amount cant be zero" },
+  );
 export const registerSchema = z.object({
   firstName: z
     .string()
@@ -26,20 +40,7 @@ export const loginSchema = z.object({
 
 export const transactionSchema = z.object({
   receiver: z.uuid(),
-  amount: z
-    .string()
-    .regex(/^(?:[1-9]\d{0,17}|(?:[1-9]\d{0,17}|0)\.\d{1,2})$/, {
-      message: "please provide a valid amount",
-    })
-    .refine(
-      (val) => {
-        if (val === "0.00" || val === "0.0") {
-          return false;
-        }
-        return true;
-      },
-      { message: "the transfer amount cant be zero" },
-    ),
+  amount: amountSchema,
 });
 
 export const paginationSchema = z.object({
@@ -57,7 +58,24 @@ export const idempotentKeySchema = z.object({
   idempotencykey: z.uuid(),
 });
 
+export const bankTransferSchema = z.object({
+  amount: amountSchema,
+  direction: z.enum(["deposit", "withdrawal"]),
+});
+
+export const bankTransferQueuePayloadSchema = z.object({
+  id: z.uuid(),
+  transactionId: z.uuid(),
+  type: z.enum(["BANK_DEPOSIT", "BANK_WITHDRAWAL"]),
+  userId: z.uuid(),
+  amount: amountSchema,
+});
+
 export type RegisterInputs = z.infer<typeof registerSchema>;
 export type PaginationInputs = z.infer<typeof paginationSchema>;
 export type LoginInputs = z.infer<typeof loginSchema>;
 export type TransactionInputs = z.infer<typeof transactionSchema>;
+export type BankTransferInputs = z.infer<typeof bankTransferSchema>;
+export type BankTransferQueuePayloadInputs = z.infer<
+  typeof bankTransferQueuePayloadSchema
+>;
