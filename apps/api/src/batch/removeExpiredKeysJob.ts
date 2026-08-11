@@ -1,6 +1,6 @@
 import { prisma } from "@payments/db/client";
 
-// Honor an idempotency key for 24h, then it's reclaimable (D2). The batch size keeps
+// Honor an idempotency key for 24h, then it's reclaimable. The batch size keeps
 // each DELETE small so a large backlog never holds a long lock or spikes WAL at once.
 const RETENTION_MS = 24 * 60 * 60 * 1000;
 const BATCH_SIZE = 1000;
