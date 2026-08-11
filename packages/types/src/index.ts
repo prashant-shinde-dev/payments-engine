@@ -14,3 +14,11 @@ export interface SafeUser {
   lastName: string;
   createdAt: Date;
 }
+
+export interface BankTransferQueuePayload {
+  id: string;
+  transactionId: string;
+  type: string;
+  amount: string;
+  userId: string;
+}
