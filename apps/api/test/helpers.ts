@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { HOUSE_USER_ID, HOUSE_WALLET_ID, prisma } from "@payments/db/client";
 import { createApp } from "../src/app.js";
 import type { SafeUser } from "@payments/types";
-import Decimal from "decimal.js";
+import { Decimal } from "decimal.js";
 
 /**
  * One shared in-process app for the whole suite. Supertest drives it directly —
@@ -60,7 +60,8 @@ export function authHeader(token: string): { Authorization: string } {
 }
 
 // Funds a wallet as a balanced house->user opening movement so SUM(legs) matches the
-// cached balance. TODO(#010): route through postLedger once it takes a type param.
+// cached balance. Deliberately not routed through postLedger: a fixture that shares the
+// production write path can't be trusted to prove the production write path is correct.
 export async function fundWallet(
   userId: string,
   amount: string,

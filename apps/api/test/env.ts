@@ -40,5 +40,15 @@ if (!databaseName.endsWith("_test")) {
   );
 }
 
+// Same guard, second store. The outbox suite obliterates its queue between tests, so a
+// REDIS_URL left on the default logical database would wipe the dev queue instead.
+const redisUrl = process.env.REDIS_URL;
+if (redisUrl && !/\/[1-9]\d*$/.test(new URL(redisUrl).pathname)) {
+  throw new Error(
+    `Refusing to run the test suite against Redis "${redisUrl}". ` +
+      `The test REDIS_URL must select a non-default logical database (e.g. .../1).`,
+  );
+}
+
 export const TEST_DATABASE_URL = url;
 export const TEST_DATABASE_NAME = databaseName;

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import Decimal from "decimal.js";
+import { Decimal } from "decimal.js";
 import { prisma } from "@payments/db/client";
-import { deriveBalance, fundWallet, registerUser } from "./helpers.ts";
-import { send } from "../src/services/wallet.service.ts";
+import { deriveBalance, fundWallet, registerUser } from "./helpers.js";
+import { send } from "../src/services/wallet.service.js";
 
 describe("double-entry ledger", () => {
   it("keeps each wallet's balance equal to the sum of its ledger legs", async () => {
