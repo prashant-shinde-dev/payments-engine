@@ -10,8 +10,11 @@ import { HOUSE_USER_ID, HOUSE_WALLET_ID, prisma } from "@payments/db/client";
  * repeatedly with no manual cleanup. CASCADE clears FK-linked rows in one pass.
  */
 beforeEach(async () => {
+  // The outbox tables are listed explicitly: neither carries a foreign key (the outbox
+  // holds a transaction's id, not a reference to it — the row must outlive a purge of
+  // old transactions), so CASCADE never reaches them.
   await prisma.$executeRawUnsafe(
-    'TRUNCATE "User", "Wallet", "Transaction", "IdempotencyRecord" CASCADE',
+    'TRUNCATE "User", "Wallet", "Transaction", "IdempotencyRecord", "TransactionOutbox", "IdempotencyJobRecord" CASCADE',
   );
   // Re-seed the house account that TRUNCATE removes; every test needs it back.
   await prisma.user.create({

@@ -26,6 +26,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # The outbox suite publishes to a real BullMQ queue — the crash-window and
+      # duplicate-delivery proofs are worthless against a mock. apps/api/.env.test
+      # points REDIS_URL at logical database 1 on this service.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

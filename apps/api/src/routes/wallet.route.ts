@@ -1,5 +1,6 @@
 import express, { Request, Response } from "express";
 import {
+  bankTransfer,
   getBalance,
   getTransactions,
   transferCore,
@@ -7,6 +8,7 @@ import {
 import { runIdempotent } from "../services/idempotency.js";
 
 import {
+  bankTransferSchema,
   idempotentKeySchema,
   paginationSchema,
   transactionSchema,
@@ -55,6 +57,23 @@ router.post("/transfer", async (req: Request, res: Response) => {
       receiver,
       amount,
     },
+  );
+  res
+    .status(201)
+    .json({ success: true, data: transaction } satisfies ApiResponse<
+      typeof transaction
+    >);
+});
+
+router.post("/banktransfer", async (req: Request, res: Response) => {
+  const { direction, amount } = validate(bankTransferSchema, req.body);
+  const sender = req.user!.userId;
+  const { idempotencykey } = validate(idempotentKeySchema, req.headers);
+  const transaction = await runIdempotent(
+    sender,
+    idempotencykey,
+    bankTransfer,
+    { user: sender, amount, direction },
   );
   res
     .status(201)
