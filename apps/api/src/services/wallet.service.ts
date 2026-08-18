@@ -1,5 +1,6 @@
 import {
   HOUSE_USER_ID,
+  CLEARING_ACC_USER_ID,
   Prisma,
   prisma,
   TransactionStatus,
@@ -115,11 +116,11 @@ export async function bankTransfer(
   const { user, amount, direction } = data;
   const amt = new Decimal(amount);
 
-  // The house is the counter-account for money crossing the system boundary, so a
+  // The Clearing is the counter-account for money crossing the system boundary, so a
   // deposit and a withdrawal are the same posting with the roles swapped.
   const isDeposit = direction === "deposit";
   const sender = isDeposit ? HOUSE_USER_ID : user;
-  const receiver = isDeposit ? user : HOUSE_USER_ID;
+  const receiver = CLEARING_ACC_USER_ID;
   const type: TransactionType = isDeposit ? "BANK_DEPOSIT" : "BANK_WITHDRAWAL";
   const status: TransactionStatus = "PENDING";
 
@@ -133,12 +134,20 @@ export async function bankTransfer(
   ) {
     throw new InsufficientFundsError("insufficient funds to send money");
   }
-  const transaction = await postLedger(txn, {
-    to: receiverWallet,
-    from: senderWallet,
-    amt,
+  const { fromUserId, toUserId } = getParties(type, user);
+
+  const transaction = await recordTransaction(txn, {
+    fromUserId,
+    toUserId,
     type,
     status,
+    amount: amt,
+  });
+  await postLedger(txn, {
+    to: receiverWallet,
+    from: senderWallet,
+    amount: amt,
+    transactionId: transaction.id,
   });
 
   await writeOutbox(txn, {
@@ -167,8 +176,8 @@ export async function transferCore(
     receiver,
   });
   if (
-    senderWallet.accountType === "SYSTEM" ||
-    receiverWallet.accountType === "SYSTEM"
+    senderWallet.accountType !== "CUSTOMER" ||
+    receiverWallet.accountType !== "CUSTOMER"
   ) {
     throw new NotFoundError("receiver's wallet could not be found");
   }
@@ -176,12 +185,18 @@ export async function transferCore(
     throw new InsufficientFundsError("insufficient funds to send money");
   }
 
-  const transaction = await postLedger(txn, {
-    to: receiverWallet,
-    from: senderWallet,
-    amt,
+  const transaction = await recordTransaction(txn, {
+    fromUserId: sender,
+    toUserId: receiver,
     type: "P2P_TRANSFER",
     status: "SUCCESS",
+    amount: amt,
+  });
+  await postLedger(txn, {
+    to: receiverWallet,
+    from: senderWallet,
+    amount: amt,
+    transactionId: transaction.id,
   });
 
   return buildResult(transaction);
@@ -234,57 +249,39 @@ async function postLedger(
   data: {
     to: Wallet;
     from: Wallet;
-    amt: Decimal;
-    type: TransactionType;
-    status: TransactionStatus;
+    amount: Decimal;
+    transactionId: string;
   },
-): Promise<TransactionResult> {
-  const { to, from, amt, type, status } = data;
-  if (type === "P2P_TRANSFER") {
-    await txn.wallet.update({
-      where: { userId: from.userId },
-      data: { balance: { decrement: amt } },
-    });
-    await txn.wallet.update({
-      where: { userId: to.userId },
-      data: { balance: { increment: amt } },
-    });
-  }
-
-  const transaction = await txn.transaction.create({
-    data: {
-      fromUserId: from.userId,
-      toUserId: to.userId,
-      type,
-      status,
-      amount: amt,
-    },
-    include: {
-      fromUser: { select: { firstName: true, lastName: true } },
-      toUser: { select: { firstName: true, lastName: true } },
-    },
+): Promise<void> {
+  const { to, from, amount, transactionId } = data;
+  await txn.wallet.update({
+    where: { userId: from.userId },
+    data: { balance: { decrement: amount } },
+  });
+  await txn.wallet.update({
+    where: { userId: to.userId },
+    data: { balance: { increment: amount } },
   });
 
   const senderLedger = await txn.ledgerEntry.create({
     data: {
-      transactionId: transaction.id,
+      transactionId,
       walletId: from.id,
-      amount: amt.negated(),
+      amount: amount.negated(),
     },
   });
 
   const receiverLedger = await txn.ledgerEntry.create({
     data: {
-      transactionId: transaction.id,
+      transactionId,
       walletId: to.id,
-      amount: amt,
+      amount: amount,
     },
   });
 
   if (!senderLedger.amount.plus(receiverLedger.amount).isZero()) {
     throw new ConflictError("The Ledger does not conserve");
   }
-  return transaction;
 }
 
 async function writeOutbox(
@@ -305,6 +302,37 @@ async function writeOutbox(
       status,
       userId,
       amount,
+    },
+  });
+}
+
+function getParties(
+  type: Extract<TransactionType, "BANK_DEPOSIT" | "BANK_WITHDRAWAL">,
+  user: string,
+): { fromUserId: string; toUserId: string } {
+  switch (type) {
+    case "BANK_DEPOSIT":
+      return { fromUserId: HOUSE_USER_ID, toUserId: user };
+    case "BANK_WITHDRAWAL":
+      return { fromUserId: user, toUserId: HOUSE_USER_ID };
+  }
+}
+
+async function recordTransaction(
+  txn: Prisma.TransactionClient,
+  data: {
+    fromUserId: string;
+    toUserId: string;
+    type: TransactionType;
+    status: TransactionStatus;
+    amount: Decimal;
+  },
+): Promise<TransactionResult> {
+  return await txn.transaction.create({
+    data,
+    include: {
+      fromUser: { select: { firstName: true, lastName: true } },
+      toUser: { select: { firstName: true, lastName: true } },
     },
   });
 }

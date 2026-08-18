@@ -2,7 +2,13 @@
 // (imported just below) reads DATABASE_URL at construction time.
 import "./env.js";
 import { afterAll, beforeEach } from "vitest";
-import { HOUSE_USER_ID, HOUSE_WALLET_ID, prisma } from "@payments/db/client";
+import {
+  HOUSE_USER_ID,
+  HOUSE_WALLET_ID,
+  CLEARING_ACC_USER_ID,
+  CLEARING_ACC_WALLET_ID,
+  prisma,
+} from "@payments/db/client";
 
 /**
  * Per-test isolation. Every test builds its own world through helpers; this wipes
@@ -25,7 +31,8 @@ beforeEach(async () => {
       firstName: "System",
       lastName: "House",
       // Locked sentinel — bcrypt of a discarded secret; never authenticates.
-      passwordHash: "$2b$12$fpPUwExH8HQsMdELclHwBesI9pnZB3kQ8F7Mu/eTKvDbwfIcmeunC",
+      passwordHash:
+        "$2b$12$fpPUwExH8HQsMdELclHwBesI9pnZB3kQ8F7Mu/eTKvDbwfIcmeunC",
     },
   });
   await prisma.wallet.create({
@@ -35,6 +42,27 @@ beforeEach(async () => {
       balance: "0",
       currency: "INR",
       accountType: "SYSTEM",
+    },
+  });
+  await prisma.user.create({
+    data: {
+      id: CLEARING_ACC_USER_ID,
+      email: "clearing@system.invalid",
+      phoneNumber: "SYSTEM_CLEARING_ACCOUNT",
+      firstName: "System",
+      lastName: "Clearing",
+      // Locked sentinel — bcrypt of a discarded secret; never authenticates.
+      passwordHash:
+        "$2b$12$fpPUwExH8HQsMdELclHwBesI9pnZB3kQ8F7Mu/eTKvDbwfIcmeunC",
+    },
+  });
+  await prisma.wallet.create({
+    data: {
+      id: CLEARING_ACC_WALLET_ID,
+      userId: CLEARING_ACC_USER_ID,
+      balance: "0",
+      currency: "INR",
+      accountType: "CLEARING",
     },
   });
 });
