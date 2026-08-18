@@ -21,4 +21,9 @@ export type {
 
 export { Prisma } from "./generated/prisma/client.js";
 
-export { HOUSE_USER_ID, HOUSE_WALLET_ID } from "./constants.js";
+export {
+  HOUSE_USER_ID,
+  HOUSE_WALLET_ID,
+  CLEARING_ACC_USER_ID,
+  CLEARING_ACC_WALLET_ID,
+} from "./constants.js";
