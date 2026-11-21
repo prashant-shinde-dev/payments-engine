@@ -604,8 +604,8 @@ which stays correct if the invariant is ever lifted.
 
 ## ADR-015: The Consumer Claims Before It Acts (At-Most-Once at the Bank Boundary)
 
-**Status:** Accepted — the gap it documents is closed by the async bank flow's outbound idempotency key
-**Date:** Layer 2
+**Status:** Superseded by ADR-017 — the at-most-once gap it accepted is closed by the outbound idempotency key
+**Date:** 2026-08-11
 
 **Context:**
 The consumer does two things: record that it handled the event (the dedup claim) and perform the
@@ -644,3 +644,108 @@ a request-state machine — record `PENDING` + the key *before* the call, call, 
 `IdempotencyJobRecord` grows from a boolean "seen" into a status record. (An idempotent *inbound*
 webhook handler dedupes the bank's callbacks to us and is also required — it does nothing about our
 own duplicate outbound call. Only the outbound key does.)
+
+---
+
+## ADR-017: The Outbound Idempotency Key Is the Transaction Id, Sent Verbatim
+
+**Status:** Accepted — supersedes ADR-015's at-most-once limitation
+**Date:** 2026-10-01
+
+**Context:**
+The bank is not idempotent. After an ambiguous failure — a timeout, a connection reset, a crash
+between the call and the response — a retry may pay twice and not retrying may pay zero times, and
+the information needed to tell those apart does not exist on this side of the wire. ADR-015 accepted
+that gap deliberately, choosing at-most-once because a missed payment is recoverable by
+reconciliation and a double payment is not. Closing it means sending something the *bank* can use to
+recognise a retry as the same request. Two things then have to be decided: which identifier the key
+is anchored to, and whether that identifier is transformed on its way to the wire.
+
+**Options Considered:**
+
+Which identifier the key is anchored to:
+
+| Option | Fails when |
+|---|---|
+| A fresh UUID per attempt | Always — a restart produces a new key and the bank sees a new request. Not a key |
+| The outbox row id | ADR-014's 1:1 is lifted — one transfer emitting two rows becomes two keys, and two payments |
+| **`Transaction.id`** | — 1:1 with the transfer instruction by construction |
+
+Whether it is transformed for the wire:
+
+| Option | Cost | Buys |
+|---|---|---|
+| **Verbatim, as the body's `pspReferenceId`** | A provider criterion narrower than a canonical uuid cannot be met without a change here | One identifier, nothing to persist, nothing to drift |
+| Derived — UUIDv5 over `Transaction.id` | A derivation function, a persisted key column, a drift risk, a separate header | Nothing today. See below — this was built, then removed |
+
+**Decision:** The outbound key is `Transaction.id`, sent verbatim as the request body's
+`pspReferenceId`. No derivation, and no separate `Idempotency-Key` header.
+
+**Rationale:**
+
+*Why the transaction id and not the outbox row id.* The consumer dedups on the outbox row id because
+that is **message** identity — "have I processed this delivery?". The bank dedups on **instruction**
+identity — "have I been told to move this money?". Those coincide only while ADR-014's
+`transactionId @unique` holds, and ADR-014 already records the condition that lifts it (a transaction
+emitting more than one lifecycle event). Under that change the outbox row id quietly stops being 1:1
+with the payment, and a key that is not 1:1 with the instruction is not an idempotency key. ADR-014
+pinned consumer dedup to the message id precisely so it survives the invariant being lifted; the
+outbound key must be pinned to the opposite thing, for the same reason.
+
+*Why not derived — recorded because it was built first and then removed.* A UUIDv5 over the
+transaction id is another canonical UUID: 36 characters in, 36 characters out, same charset, same
+opacity, equality its only property. **A derivation whose output shape equals its input shape is a
+relabeling, not an encoding layer.** It satisfies no provider criterion the transaction id does not
+already satisfy — including the one reached for to justify it, ISO 20022's `Max35Text`, which a
+36-character derived key misses by exactly the same one character.
+
+*Why key minting is provider-shaped rather than engine-shaped.* This is the argument that settles
+it. An ISO 20022 `EndToEndId`, a Stripe idempotency key and a UPI RRN are three different
+derivations under three different constraints — length, charset, structure, honoured lifetime. There
+is no single "derive the key" function to write, because the rules live with the provider, not with
+the engine. At several providers this becomes a minting concern owned by each provider's adapter —
+in a large system, plausibly its own service, parameterised per provider. One generic derivation at
+one provider is therefore not a smaller version of that design; it is a different and wrong one,
+which would have to be undone rather than extended. Deferring it costs nothing, because the right
+shape only becomes knowable once a second provider's criterion is a real constraint rather than an
+imagined one.
+
+*Why the persistence argument does not rescue it.* Persisting a derived key was argued for on the
+grounds that the derivation could change between a submit and its retry, re-keying an in-flight
+transfer into a second payment. That risk is real, but it is **created by** having a derivation.
+With none, there is nothing to drift and no column to carry.
+
+*Why no separate header.* The key is already on the wire: §3.1 carries `Transaction.id` as the
+body's `pspReferenceId`. A header would transport one identifier twice, carrying no information the
+body does not, and would invent a state that cannot legitimately occur — header disagreeing with
+body — which the bank would then have to specify, answer and test. A header earns its place when the
+key can differ from the business reference, which is the same trigger as the minting layer above.
+Identifying a payment by a field in the message is also the rail convention the contract follows
+elsewhere.
+
+**Trade-offs:**
+The key makes a retry safe; it does not make the outcome **knowable**. A crash between "about to
+call" and "answer received" still needs a durable attempt record committed before the call, so the
+in-doubt state is representable rather than guessed. ADR-015's gap is closed by the two together,
+not by the key alone.
+
+The bank honours a key for 24 hours while transaction ids are unique forever, so a re-drive beyond
+that window is a genuinely new request at the bank. Any reconciliation acting past 24h must query
+the bank first rather than re-submit blind.
+
+A verbatim identifier has nowhere to put an attempt or epoch component, so **deliberately** re-issuing
+a transfer as a new instruction at the bank is not expressible — it needs a design change, not a
+parameter. Accepted while there is one provider and no re-issue flow; it is listed below as a
+revisit trigger rather than left to be rediscovered.
+
+**Revisit when:**
+- A provider's criterion cannot be met by a canonical uuid → key minting moves behind that
+  provider's adapter, shaped to its rules. Not a generic engine-wide derivation.
+- A transfer must be re-issued as a genuinely new instruction at the bank → the key needs room for
+  an attempt component, which a verbatim identifier does not have.
+- A second provider is integrated → minting, the header question and the body-field naming are
+  decided together, against a real criterion.
+- ADR-014's `transactionId @unique` is dropped → nothing here changes, which is the point of
+  anchoring to the transaction rather than to the message.
+
+---

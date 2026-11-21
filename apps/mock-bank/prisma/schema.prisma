@@ -1,0 +1,71 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model TransferRequest {
+  id             String   @id() @default(uuid())
+  amount         Decimal  @db.Decimal(20, 2)
+  pspReferenceId String   @unique // the transactionId from the payments_engine
+  status         Status   @default(RECEIVED)
+  createdAt      DateTime @default(now())
+  currency       String   @default("INR")
+}
+
+model TransactionEvent {
+  eventId            String           @id() @default(uuid())
+  trackingId         String
+  pspReferenceId     String
+  amount             Decimal          @db.Decimal(20, 2)
+  type               Type             @default(TRANSFER)
+  status             Status
+  currency           String           @default("INR")
+  rejectionReason    RejectionReason?
+  originalTrackingId String?
+  receivedAt         DateTime
+  settledAt          DateTime         @default(now())
+  deliveryStatus     DeliveryStatus   @default(PENDING)
+  attempts           Int              @default(0)
+  nextAttempt        DateTime         @default(now())
+  lastError          String?
+
+  @@unique([trackingId, status])
+  @@index([nextAttempt])
+}
+
+enum RejectionReason {
+  INSUFFICIENT_FUNDS
+  ACCOUNT_CLOSED
+  ACCOUNT_NOT_FOUND
+  INVALID_ACCOUNT
+  ACCOUNT_BLOCKED
+  LIMIT_EXCEEDED
+  CURRENCY_NOT_SUPPORTED
+}
+
+enum Status {
+  RECEIVED
+  REJECTED
+  SETTLED
+}
+
+enum Type {
+  TRANSFER
+  RETURN
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  UNDELIVERABLE
+  EXHAUSTED
+}

@@ -15,6 +15,26 @@ services:
     ports:
       - "5432:5432"
 
+  bank:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER_BANK}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD_BANK}
+      POSTGRES_DB: ${POSTGRES_DB_BANK}
+    volumes:
+      - bank-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER_BANK} -d ${POSTGRES_DB_BANK}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5433:5432"
+
   redis:
     image: redis:7-alpine
     ports:
@@ -27,3 +47,4 @@ services:
 
 volumes:
   db-data:
+  bank-data:
