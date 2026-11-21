@@ -360,6 +360,29 @@ Query params: page, limit (default: page=1, limit=20)
 
 ---
 
+## The Mock Bank
+
+`apps/mock-bank` implements the bank side of the contract with its own database. It models no
+customer accounts: it records instructions, settles them, and reports outcomes.
+
+```
+POST /api/v1/transfer          verify signature → validate → record TransferRequest (RECEIVED)
+                               → 202. A repeat of the same reference is answered from the record;
+                               the same reference with a different instruction is refused.
+GET  /api/v1/transfer/{ref}    one resource in every state; 404 only if the reference never arrived
+
+processor (own process)        claims RECEIVED requests (FOR UPDATE SKIP LOCKED), writes the outcome
+                               event and the request's new status in one transaction
+notifier  (own process)        claims due events with a lease (UPDATE … SKIP LOCKED … RETURNING),
+                               delivers them signed, retries 6 times on a widening schedule, then
+                               marks them EXHAUSTED; a refusal retrying cannot change → UNDELIVERABLE
+```
+
+Both background steps drain while batches come back full, sleep when they do not, back off on
+failure, and finish the batch in flight on `SIGTERM`.
+
+---
+
 ## Known Limitations (Layer 1)
 
 These are intentional. Each will be demonstrated as a failure, then fixed.
@@ -384,6 +407,7 @@ These are intentional. Each will be demonstrated as a failure, then fixed.
 ```yaml
 # docker-compose.yml runs:
 postgres:  port 5432  (payments DB)
+bank:      port 5433  (the mock bank's own database)
 redis:     port 6379  (BullMQ dispatch — no volume: jobs are disposable,
                        Postgres holds the truth and the relay re-publishes)
 ```
@@ -395,6 +419,10 @@ npm run dev          API server        apps/api/src/index.ts
 npm run dev:relay    outbox publisher  apps/api/src/relay.ts   → src/outbox/relay.ts
 npm run dev:worker   bank consumer     apps/api/src/worker.ts  → src/outbox/consumer.ts
 ```
+
+The mock bank runs as three more, from `apps/mock-bank`: `npm run dev` (its API, port 8080),
+`npm run dev:processor` (settlement) and `npm run dev:notifier` (callback delivery). It is specified
+by [`docs/bank-api-contract.md`](bank-api-contract.md); the engine does not call it yet.
 
 Neither background process is required for the API to accept a bank transfer — the
 outbox row simply accumulates as `PENDING` and drains when the relay comes back. That

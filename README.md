@@ -141,29 +141,35 @@ Key decisions:
 git clone https://github.com/prashant-shinde-dev/payments-engine
 cd payments-engine
 
-# 2. Start infrastructure
+# 2. Set up environment — each process reads the .env in its own directory
+cp .env.example .env                                  # docker-compose: both Postgres containers
+cp .env.example apps/api/.env                         # API, relay and worker
+cp .env.example packages/db/.env                      # engine migrations
+cp apps/mock-bank/.env.example apps/mock-bank/.env    # mock bank: fill in every value
+# DATABASE_URL and JWT_SECRET for the engine; the mock bank's DATABASE_URL points at port 5433
+
+# 3. Start infrastructure
 docker-compose up -d
 
-# 3. Install dependencies
+# 4. Install dependencies (also generates both Prisma clients)
 npm install
 
-# 4. Set up environment
-cp .env.example .env
-# Edit .env — DATABASE_URL and JWT_SECRET
-
 # 5. Run migrations
-npm run db:migrate
+npm run db:migrate --workspace=@payments/db
+(cd apps/mock-bank && npx prisma migrate deploy)
 
-# 6. Start development
+# 6. Start development — the API, the web app and the mock bank's API
 npm run dev
 
-# 7. In separate terminals — the outbox pipeline (optional; the API works without
-#    them, events just queue up as PENDING until the relay runs)
-npm run dev:relay  --workspace=@payments/api
-npm run dev:worker --workspace=@payments/api
+# 7. In separate terminals — background processes (optional; nothing is lost
+#    without them, work queues up until they run)
+npm run dev:relay     --workspace=@payments/api    # outbox → queue
+npm run dev:worker    --workspace=@payments/api    # queue → bank
+npm run dev:processor --workspace=mock-bank        # the bank settles received transfers
+npm run dev:notifier  --workspace=mock-bank        # the bank delivers callbacks
 ```
 
-API runs on `http://localhost:3001`
+API runs on `http://localhost:3001` · mock bank on `http://localhost:8080` (its contract: [`docs/bank-api-contract.md`](docs/bank-api-contract.md))
 Web runs on `http://localhost:3000`
 
 ---
