@@ -42,11 +42,6 @@ model TransactionOutbox {
   @@index([publishStatus, createdAt])
 }
 
-model IdempotencyJobRecord {
-  eventId   String   @id
-  createdAt DateTime @default(now())
-}
-
 model Wallet {
   id          String        @id @default(uuid())
   userId      String        @unique
@@ -100,6 +95,16 @@ model IdempotencyRecord {
   @@index([createdAt])
 }
 
+model BankRequest {
+  eventId       String            @id // the outbox row id — the dedup identity
+  transactionId String            @unique // also the key the bank dedups on (ADR-017)
+  status        BankRequestStatus @default(SUBMITTING) // SUBMITTING → SUBMITTED | HALTED (ADR-020)
+  bankReference String? // the bank's own id, once known
+  lastError     String?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+}
+
 enum TransactionType {
   P2P_TRANSFER
   BANK_DEPOSIT
@@ -123,4 +128,10 @@ enum OutboxStatus {
   PENDING
   PUBLISHED
   FAILED
+}
+
+enum BankRequestStatus {
+  SUBMITTING
+  SUBMITTED
+  HALTED
 }

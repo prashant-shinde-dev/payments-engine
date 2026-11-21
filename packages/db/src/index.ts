@@ -17,6 +17,8 @@ export type {
   Wallet,
   Transaction,
   TransactionOutbox,
+  BankRequest,
+  BankRequestStatus,
 } from "./generated/prisma/client.js";
 
 export { Prisma } from "./generated/prisma/client.js";

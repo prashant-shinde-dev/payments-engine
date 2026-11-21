@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { prisma, TransactionOutbox } from "@payments/db/client";
 import type { BankTransferQueuePayload } from "@payments/types";
-import { Job, Queue } from "bullmq";
+import type { BankResponse } from "@payments/zod-schemas";
+import { Job, Queue, UnrecoverableError } from "bullmq";
 import { Decimal } from "decimal.js";
 import type { Redis } from "ioredis";
 import request from "supertest";
@@ -98,6 +99,16 @@ function nextEvent(
       resolve(job!);
     });
   });
+}
+
+/** The bank's 202 for a payload, with a tracking id the assertions can predict. */
+function acceptedBy(payload: BankTransferQueuePayload): BankResponse {
+  return {
+    trackingId: `bank-${payload.id}`,
+    pspReferenceId: payload.transactionId,
+    status: "RECEIVED",
+    receivedAt: new Date().toISOString(),
+  };
 }
 
 /**
@@ -282,6 +293,7 @@ describe("transactional outbox", () => {
       const effects: string[] = [];
       consumer = createBankTransferConsumer(async (payload) => {
         effects.push(payload.id);
+        return acceptedBy(payload);
       });
 
       const firstDelivery = nextEvent("completed");
@@ -300,18 +312,23 @@ describe("transactional outbox", () => {
 
       expect(redelivered.id).toBe(row.id);
       expect(effects).toEqual([row.id]);
-      expect(await prisma.idempotencyJobRecord.count()).toBe(1);
+      expect(await prisma.bankRequest.count()).toBe(1);
     });
 
-    it("does not repeat an effect when a job is retried", async () => {
+    it("re-sends an in-doubt request on retry and records the outcome", async () => {
       const user = await registerUser();
       await deposit(user, "60.00");
       const row = await theOutboxRow();
 
       let invocations = 0;
-      consumer = createBankTransferConsumer(async () => {
+      consumer = createBankTransferConsumer(async (payload) => {
         invocations++;
-        throw new Error("bank unreachable");
+        // Fail the first attempt the way a timeout does: the row is already committed as
+        // SUBMITTING and nothing is known about whether the bank acted on it.
+        if (invocations === 1) {
+          throw new Error("bank unreachable");
+        }
+        return acceptedBy(payload);
       });
 
       const failure = nextEvent("failed");
@@ -320,15 +337,48 @@ describe("transactional outbox", () => {
       await failure;
       await retry;
 
-      // The retry is the SAME job re-run. It finds the claim already committed and
-      // returns without acting — one delivery, one attempt at the effect, one record.
-      expect(invocations).toBe(1);
-      expect(await prisma.idempotencyJobRecord.count()).toBe(1);
+      // The retry is the SAME job re-run, and it MUST reach the bank again: the first attempt
+      // claimed and never recorded an outcome, so skipping it would drop the payment silently.
+      // Re-sending is safe because the bank dedups on the reference we send.
+      expect(invocations).toBe(2);
+      expect(await prisma.bankRequest.count()).toBe(1);
       expect(
-        await prisma.idempotencyJobRecord.findUnique({
-          where: { eventId: row.id },
-        }),
-      ).not.toBeNull();
+        await prisma.bankRequest.findUnique({ where: { eventId: row.id } }),
+      ).toMatchObject({
+        status: "SUBMITTED",
+        bankReference: `bank-${row.id}`,
+      });
+    });
+
+    it("halts a request the bank refuses, without retrying it or moving money", async () => {
+      const user = await registerUser();
+      await deposit(user, "75.00");
+      const row = await theOutboxRow();
+
+      let invocations = 0;
+      consumer = createBankTransferConsumer(async () => {
+        invocations++;
+        // What submitToBank raises for a refusal no retry can change (401, 400, a reused key).
+        throw new UnrecoverableError("bank refused the request [AUTHENTICATION_FAILED]");
+      });
+
+      const failure = nextEvent("failed");
+      await drain();
+      await failure;
+
+      expect(invocations).toBe(1);
+      expect(await (await inspector.getJob(row.id))!.getState()).toBe("failed");
+      expect(
+        await prisma.bankRequest.findUnique({ where: { eventId: row.id } }),
+      ).toMatchObject({
+        status: "HALTED",
+        lastError: "bank refused the request [AUTHENTICATION_FAILED]",
+      });
+      // A refused request is not a refused transfer: an earlier attempt may have landed, so the
+      // hold stays and only a callback decides the outcome.
+      expect(
+        await prisma.transaction.findUnique({ where: { id: row.transactionId } }),
+      ).toMatchObject({ status: "PENDING" });
     });
   });
 

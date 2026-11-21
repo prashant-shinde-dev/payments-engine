@@ -1,5 +1,9 @@
 import z from "zod";
 
+const isoTimestamp = z.iso.datetime({
+  message: "Invalid ISO 8601 UTC timestamp",
+});
+
 const amountSchema = z
   .string()
   .regex(/^(?:[1-9]\d{0,17}|(?:[1-9]\d{0,17}|0)\.\d{1,2})$/, {
@@ -71,6 +75,15 @@ export const bankTransferQueuePayloadSchema = z.object({
   amount: amountSchema,
 });
 
+const bankTransferStatusSchema = z.enum(["RECEIVED", "REJECTED", "SETTLED"]);
+
+export const bankResponseSchema = z.object({
+  trackingId: z.uuid(),
+  pspReferenceId: z.uuid(),
+  status: bankTransferStatusSchema,
+  receivedAt: isoTimestamp,
+});
+
 export type RegisterInputs = z.infer<typeof registerSchema>;
 export type PaginationInputs = z.infer<typeof paginationSchema>;
 export type LoginInputs = z.infer<typeof loginSchema>;
@@ -79,3 +92,4 @@ export type BankTransferInputs = z.infer<typeof bankTransferSchema>;
 export type BankTransferQueuePayloadInputs = z.infer<
   typeof bankTransferQueuePayloadSchema
 >;
+export type BankResponse = z.infer<typeof bankResponseSchema>;

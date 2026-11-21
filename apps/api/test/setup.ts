@@ -20,7 +20,7 @@ beforeEach(async () => {
   // holds a transaction's id, not a reference to it — the row must outlive a purge of
   // old transactions), so CASCADE never reaches them.
   await prisma.$executeRawUnsafe(
-    'TRUNCATE "User", "Wallet", "Transaction", "IdempotencyRecord", "TransactionOutbox", "IdempotencyJobRecord" CASCADE',
+    'TRUNCATE "User", "Wallet", "Transaction", "IdempotencyRecord", "TransactionOutbox", "BankRequest" CASCADE',
   );
   // Re-seed the house account that TRUNCATE removes; every test needs it back.
   await prisma.user.create({
