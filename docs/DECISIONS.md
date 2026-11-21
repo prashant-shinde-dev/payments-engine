@@ -749,3 +749,65 @@ revisit trigger rather than left to be rediscovered.
   anchoring to the transaction rather than to the message.
 
 ---
+
+## ADR-020: The Bank Acknowledges; Every Outcome Arrives by Callback
+
+**Status:** Accepted
+**Date:** 2026-11-20
+
+**Context:**
+The engine submits a transfer and the bank answers. The question is what that answer is allowed to
+mean. If a submit can return "rejected" synchronously, the consumer that made the call must move
+money (release the hold), and the engine has two channels that can each report the same outcome. The
+same call also has refusals that are *not* outcomes: an authentication failure or a reused key
+refuses this *request* and says nothing about whether an earlier attempt under the same reference
+was accepted.
+
+**Options Considered:**
+
+| Option | Pro | Con |
+|---|---|---|
+| Synchronous `422 TRANSFER_REJECTED`, consumer compensates | Immediate answer | Two reporting channels and two compensation paths; the consumer's correctness depends on the bank's replay behaviour |
+| The same `422`, followed by a callback, consumer delivery-only | Sound | Keeps a code that nothing in the bank decides |
+| Leave rejected holds for the reconciliation sweep | No new path | The sweep resolves *unknown* outcomes; a known refusal would hold customer money indefinitely |
+| **`202` = accepted for processing; every outcome by callback** | One channel, one compensation path | A rejection is never immediate |
+
+**Decision:** A `202` means the instruction was validated and durably recorded (ISO 20022 `ACTC`) and
+nothing more. Every business outcome — rejection included — is a recorded state transition reported
+by callback. The consumer never moves money: it records `SUBMITTED` on a `202` and stops. Every `4xx`
+refuses the request, never the transfer. A request the worker stops sending — refused, unreadable,
+or out of attempts — is marked `HALTED`, which resolves nothing: it may still have landed, and a
+callback can still settle it. The bank's state model is `RECEIVED → SETTLED | REJECTED`.
+
+**Rationale:**
+It matches how real rails behave. ISO 20022 answers an instruction with status reports — `ACTC`,
+then `ACSC` or `RJCT` — PSD2 payment initiation returns `RCVD`/`ACTC`, ACH rejections come back as
+returns, and Stripe payouts fail by webhook. Where the bank runs a check is its own concern: a
+synchronous refusal only moves the check from inside the house to the door, at the cost of a second
+reporting channel. Synchronous is different in kind only when the caller cannot proceed without the
+decision (card authorisation); a bank transfer, settled asynchronously with the money already held
+in clearing, is not that.
+
+It also removes a race. A refused retry can follow an accepted attempt whose `202` was lost; if a
+refusal licensed compensation, the engine would release a hold the bank is about to settle. With
+the consumer delivery-only, there is exactly one compensation path: the callback handler, which
+deduplicates deliveries, locks the transfer, and applies an outcome only if the transition is legal.
+
+`HALTED` exists so that "stopped for good" is a status in the database rather than a fact only the
+queue's failed set holds. An in-flight state between `RECEIVED` and `SETTLED` was removed because
+it differed only in cancellability, which nothing offers: a state nothing branches on is surface area.
+
+**Trade-offs:**
+- A rejection is never immediate; the engine always waits for a callback.
+- A `HALTED` request must be resolved by asking the bank (the query endpoint), not by inference.
+  Re-driving it is an operator action, never a silent retry.
+- Retries stop after about five minutes (8 attempts, exponential backoff with jitter): long enough
+  for a fault or a failover, far inside the bank's 24h idempotency window.
+
+**Revisit when:**
+- A caller needs the decision synchronously → even then, the error stops the sender and a callback
+  carries the outcome.
+- Cancellation is offered → an in-flight state returns as the point after which a transfer can no
+  longer be stopped.
+
+---

@@ -37,6 +37,7 @@ A payments engine that enables users to move money in two ways:
 │                 PostgreSQL                    │
 │  Users · Wallets · LedgerEntry · Transactions │
 │  IdempotencyRecord · TransactionOutbox        │
+│  BankRequest                                  │
 └───────┬───────────────────────────────▲───────┘
         │ LISTEN/NOTIFY + claim          │ dedup key
 ┌───────▼─────────┐   BullMQ   ┌─────────┴───────┐
@@ -60,6 +61,7 @@ User ──1:N──► Transaction  (as receiver)
 Wallet ──1:N──► LedgerEntry       (its signed legs; balance = SUM(legs))
 Transaction ──1:N──► LedgerEntry  (the balanced legs of one movement)
 Transaction ──1:1──► TransactionOutbox  (the async work that movement owes)
+Transaction ──1:1──► BankRequest        (the instruction sent to the bank, and how far it got)
 ```
 
 ### Schema
@@ -151,9 +153,12 @@ model TransactionOutbox {                          // written INSIDE the transfe
   @@index([publishStatus, createdAt])                  // the relay's claim, oldest first
 }
 
-model IdempotencyJobRecord {      // consumer-level dedup: the outbox row id, once
-  eventId   String   @id
-  createdAt DateTime @default(now())
+model BankRequest {              // committed BEFORE the bank is called
+  eventId       String            @id      // the outbox row id: consumer-level dedup
+  transactionId String            @unique  // also the key the bank dedups on (ADR-017)
+  status        BankRequestStatus          // SUBMITTING → SUBMITTED | HALTED (ADR-020)
+  bankReference String?                    // the bank's trackingId, once accepted
+  lastError     String?
 }
 
 enum TransactionType {
@@ -213,8 +218,8 @@ rule so it can carry the system's float.
 to publish is written as a row in the *same* transaction as the money, so one commit means
 both "money moved" and "event owed". Two dedup identities live in the schema for two
 different boundaries: `IdempotencyRecord` keyed by the caller's `Idempotency-Key` (an HTTP
-retry), and `IdempotencyJobRecord` keyed by the outbox row id (a queue redelivery). Both
-are decided by the database, never by an application-level "have I seen this?" read.
+retry), and `BankRequest` keyed by the outbox row id (a queue redelivery), which also records
+how far the bank call got. Both are decided by the database, never by an application-level "have I seen this?" read.
 
 ---
 
@@ -327,17 +332,25 @@ Relay (own process)  LISTEN ┘  + 5s fallback poll (NOTIFY is best-effort)
              nextAttemptAt; at 5 they become FAILED (visible, re-drivable).
              Transient (infra) failures abandon the batch and burn no attempts.
 
-Worker (own process)
+Worker (own process), per job — 8 attempts, exponential backoff from 2s with 50% jitter:
   → Zod-parse job.data (the queue is a JSON boundary; a bad payload is
-    UnrecoverableError — permanent, not retried five times to the same verdict)
-  → claim:  INSERT IdempotencyJobRecord(eventId) ON CONFLICT DO NOTHING
-            no rows inserted ⇒ already handled ⇒ return, no second effect
-  → act:    the bank call — a log stand-in until the bank client lands
+    UnrecoverableError — permanent, not retried to the same verdict)
+  → claim:   INSERT BankRequest(eventId, status SUBMITTING) ON CONFLICT DO NOTHING
+             — committed BEFORE the bank is called, so a crash leaves an in-doubt row,
+               never an absence
+  → existing row?  SUBMITTING → submit again (safe: the bank dedups on Transaction.id)
+                   SUBMITTED  → done
+                   HALTED     → done; re-drive is an operator action
+  → submit:  POST /api/v1/transfer { pspReferenceId: Transaction.id, amount, currency }
+             signed (HMAC over timestamp, method, path and body), 5s wall-clock timeout
+  → 202:     BankRequest → SUBMITTED, bankReference = trackingId. No ledger write.
+  → refused (400/401/422), an unreadable 202, or the last attempt failed:
+             BankRequest → HALTED. Resolves nothing — the transfer may still have landed.
 
 Guarantees: the intent commits atomically with the money; delivery is at-least-once;
-the effect is de-duplicated by the database. Publish-then-mark means a crash between
-the two re-delivers rather than losing. See ADR-013, and ADR-015 for the one window
-that is deliberately left open.
+the attempt is recorded before the call, and a retry is safe because the bank
+deduplicates on the transaction id (ADR-017). The worker never moves money: every
+outcome arrives by callback (ADR-020).
 ```
 
 ### GET /wallet/balance
@@ -393,9 +406,9 @@ These are intentional. Each will be demonstrated as a failure, then fixed.
 | No idempotency keys | Duplicate requests send money twice | ✅ Fixed — request-level dedup + retention reaper |
 | Balance as scalar, not ledger | Cannot audit or reconstruct history | ✅ Fixed — ADR-012 |
 | Enqueue outside the transaction | A crash after commit loses the event | ✅ Fixed — ADR-013 |
-| Bank transfers never settle | A `PENDING` transaction is never resolved | Layer 2 |
-| A pending bank transfer writes legs but not the projection | `Wallet.balance != SUM(legs)` until settlement — the ledger asserts a movement the balance does not | Layer 2 — settlement decides whether pending legs wait, or post to a clearing account |
-| Consumer claims before it acts | A crash mid-handler loses that one effect | Layer 2 — closed by the bank call's outbound key (ADR-015) |
+| Bank transfers never settle | They are submitted, but no callback is received, so they stay `PENDING` | Open — the webhook is the next change |
+| A pending bank transfer writes legs but not the projection | `Wallet.balance != SUM(legs)` until settlement | ✅ Fixed — money in flight is held in a clearing account (#26) |
+| Consumer claims before it acts | A crash mid-handler loses that one effect | ✅ Fixed — request state recorded before the call + outbound key (ADR-017) |
 | No refresh tokens | Stolen JWT has no revocation path | Layer 2 |
 
 ---
@@ -422,7 +435,7 @@ npm run dev:worker   bank consumer     apps/api/src/worker.ts  → src/outbox/co
 
 The mock bank runs as three more, from `apps/mock-bank`: `npm run dev` (its API, port 8080),
 `npm run dev:processor` (settlement) and `npm run dev:notifier` (callback delivery). It is specified
-by [`docs/bank-api-contract.md`](bank-api-contract.md); the engine does not call it yet.
+by [`docs/bank-api-contract.md`](bank-api-contract.md); the engine submits to it, but does not yet receive its callbacks.
 
 Neither background process is required for the API to accept a bank transfer — the
 outbox row simply accumulates as `PENDING` and drains when the relay comes back. That
@@ -435,4 +448,7 @@ DATABASE_URL   postgresql://postgres:postgres@localhost:5432/payments
 REDIS_URL      redis://localhost:6379   (no default in code — an unset value fails fast)
 JWT_SECRET     (set locally, never committed)
 PORT           3001
+BANK_TRANSFER_HOST     http://localhost:8080
+BANK_TRANSFER_URL      /api/v1/transfer      (the path is also what the request signs)
+ENGINE_TO_BANK_SECRET  signs submits (contract §2.2)
 ```
