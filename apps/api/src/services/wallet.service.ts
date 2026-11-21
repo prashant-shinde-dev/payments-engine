@@ -3,6 +3,7 @@ import {
   CLEARING_ACC_USER_ID,
   Prisma,
   prisma,
+  Transaction,
   TransactionStatus,
   TransactionType,
   Wallet,
@@ -213,7 +214,7 @@ function buildResult(transaction: TransactionResult): TransferResult {
   };
 }
 
-async function lockAndFetchWallets(
+export async function lockAndFetchWallets(
   txn: Prisma.TransactionClient,
   data: { sender: string; receiver: string },
 ): Promise<[Wallet, Wallet]> {
@@ -242,6 +243,23 @@ async function lockAndFetchWallets(
     throw new NotFoundError("receiver's wallet could not be found");
   }
   return [senderWallet, receiverWallet];
+}
+
+export async function lockAndFetchTransaction(
+  txn: Prisma.TransactionClient,
+  transactionId: string,
+): Promise<Transaction | null> {
+  // Settlement is a read-modify-write: is this transfer still PENDING, and if so post and mark it.
+  // Two callbacks for the same transfer arriving together would otherwise both read PENDING and
+  // both post. Transaction rows are locked BEFORE wallet rows on every path that takes both, so
+  // the global lock order stays acyclic against lockAndFetchWallets.
+  const [locked] = await txn.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "Transaction" WHERE "id" = ${transactionId} FOR UPDATE
+    `;
+  if (!locked) {
+    return null;
+  }
+  return await txn.transaction.findUnique({ where: { id: transactionId } });
 }
 
 async function postLedger(
@@ -282,6 +300,31 @@ async function postLedger(
   if (!senderLedger.amount.plus(receiverLedger.amount).isZero()) {
     throw new ConflictError("The Ledger does not conserve");
   }
+}
+
+export async function postSettlement(
+  txn: Prisma.TransactionClient,
+  transaction: Transaction,
+  outcome: Extract<TransactionStatus, "SUCCESS" | "FAILED">,
+): Promise<void> {
+  const settled = outcome === "SUCCESS";
+
+  await txn.transaction.update({
+    where: { id: transaction.id },
+    data: { status: outcome },
+  });
+
+  const [clearingWallet, receiverWallet] = await lockAndFetchWallets(txn, {
+    sender: CLEARING_ACC_USER_ID,
+    receiver: settled ? transaction.toUserId : transaction.fromUserId,
+  });
+
+  await postLedger(txn, {
+    from: clearingWallet,
+    to: receiverWallet,
+    amount: transaction.amount,
+    transactionId: transaction.id,
+  });
 }
 
 async function writeOutbox(

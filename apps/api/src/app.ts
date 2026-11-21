@@ -6,6 +6,7 @@ import express, {
 } from "express";
 import { router as authRouter } from "./routes/auth.routes.js";
 import { router as walletRouter } from "./routes/wallet.route.js";
+import { router as webhookRouter } from "./routes/bank-webhook.route.js";
 import { AppError } from "./errors/index.js";
 import { authenticate } from "./middleware/auth.middleware.js";
 
@@ -19,6 +20,11 @@ import { authenticate } from "./middleware/auth.middleware.js";
 export function createApp(): Express {
   const app = express();
 
+  app.use(
+    "/api/v1/webhook",
+    express.raw({ type: "application/json", limit: "64kb" }),
+    webhookRouter,
+  );
   app.use(express.json());
 
   app.get("/health", (req, res) => {

@@ -1,4 +1,29 @@
 import z from "zod";
+import validator from "validator";
+
+function checkOutcomeFields(data: OutcomeFields, ctx: z.RefinementCtx) {
+  if (data.type === "RETURN" && data.originalTrackingId === null) {
+    ctx.addIssue({
+      code: "custom",
+      message: "originalTrackingId is required when type is 'RETURN'",
+      path: ["originalTrackingId"],
+    });
+  }
+  if (data.status === "REJECTED" && data.rejectionReason === null) {
+    ctx.addIssue({
+      code: "custom",
+      message: "rejectionReason is required when status is 'REJECTED'",
+      path: ["rejectionReason"],
+    });
+  }
+  if (data.status !== "REJECTED" && data.rejectionReason !== null) {
+    ctx.addIssue({
+      code: "custom",
+      message: "rejectionReason is only valid when status is 'REJECTED'",
+      path: ["rejectionReason"],
+    });
+  }
+}
 
 const isoTimestamp = z.iso.datetime({
   message: "Invalid ISO 8601 UTC timestamp",
@@ -77,12 +102,46 @@ export const bankTransferQueuePayloadSchema = z.object({
 
 const bankTransferStatusSchema = z.enum(["RECEIVED", "REJECTED", "SETTLED"]);
 
+const rejectionReasonSchema = z.enum([
+  "INSUFFICIENT_FUNDS",
+  "ACCOUNT_CLOSED",
+  "ACCOUNT_NOT_FOUND",
+  "INVALID_ACCOUNT",
+  "ACCOUNT_BLOCKED",
+  "LIMIT_EXCEEDED",
+  "CURRENCY_NOT_SUPPORTED",
+]);
+
 export const bankResponseSchema = z.object({
   trackingId: z.uuid(),
   pspReferenceId: z.uuid(),
   status: bankTransferStatusSchema,
   receivedAt: isoTimestamp,
 });
+
+const bankTransferRecordSchema = z.object({
+  trackingId: z.uuid(),
+  pspReferenceId: z.uuid(),
+  amount: amountSchema,
+  status: bankTransferStatusSchema,
+  currency: z.string().refine((val) => validator.isISO4217(val), {
+    message: "unsupported currency",
+  }),
+  type: z.enum(["TRANSFER", "RETURN"]),
+  // null on every non-rejection; the superRefine below ties it to the status.
+  rejectionReason: rejectionReasonSchema.nullable(),
+  originalTrackingId: z.uuid().nullable(),
+  receivedAt: isoTimestamp,
+});
+
+export const bankTransferWebhookCallbackSchema = bankTransferRecordSchema
+  .extend({
+    eventId: z.uuid(),
+    settledAt: isoTimestamp,
+  })
+  .superRefine((data, ctx) => {
+    checkOutcomeFields(data, ctx);
+  });
 
 export type RegisterInputs = z.infer<typeof registerSchema>;
 export type PaginationInputs = z.infer<typeof paginationSchema>;
@@ -93,3 +152,11 @@ export type BankTransferQueuePayloadInputs = z.infer<
   typeof bankTransferQueuePayloadSchema
 >;
 export type BankResponse = z.infer<typeof bankResponseSchema>;
+export type BankTransferWebhookCallbackInputs = z.infer<
+  typeof bankTransferWebhookCallbackSchema
+>;
+type BankTransferRecord = z.infer<typeof bankTransferRecordSchema>;
+type OutcomeFields = Pick<
+  BankTransferRecord,
+  "originalTrackingId" | "rejectionReason" | "status" | "type"
+>;
