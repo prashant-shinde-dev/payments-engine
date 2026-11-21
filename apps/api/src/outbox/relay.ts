@@ -18,9 +18,13 @@ const TXN_TIMEOUT_MS = 30_000;
 // it is what sweeps up rows whose notification was lost and rows leaving backoff.
 const FALLBACK_POLL_MS = 5_000;
 
+// ~5 min of retries before HALTED (2s doubling, plus 5s timeouts): enough for a fault or a bank
+// failover, far inside the bank's 24h idempotency window — a retry past it is a second payment.
+// Jitter 0.5 keeps each wait in [50%, 100%]: retries from one outage don't return in a single
+// burst, and an overloaded bank still gets a real pause. Contract §8.2.
 const JOB_OPTIONS = {
-  attempts: 5,
-  backoff: { type: "exponential", delay: 2_000 },
+  attempts: 8,
+  backoff: { type: "exponential", delay: 2_000, jitter: 0.5 },
   removeOnComplete: 1_000,
   removeOnFail: false, // the failed set IS the dead-letter queue — never drop silently
 } as const;
