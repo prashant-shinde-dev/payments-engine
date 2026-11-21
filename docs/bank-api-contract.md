@@ -757,7 +757,7 @@ The current implementation departs from this contract as follows. Each entry is 
 
 | Term                                   | Current behaviour                                                                                           |
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Submit (§3.1)                          | the engine does not yet submit transfers to the bank; a bank transfer stays `PENDING` with its hold in clearing |
 | Callback (§3.3)                        | the engine does not yet receive callbacks; the bank marks each event `UNDELIVERABLE` after the engine's `404` |
+| `Retry-After` honoured (§8.2)          | the engine applies the §8.2 schedule regardless                                                             |
 | Query used for recovery (§3.2, §5.2)   | the bank serves the query; the engine has no client for it yet, so a request it stopped sending is resolved only by a callback |
 | Authentication failures logged (§2.3)  | neither side logs a rejected signature                                                                      |
