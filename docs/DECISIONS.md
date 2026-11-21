@@ -647,6 +647,70 @@ own duplicate outbound call. Only the outbound key does.)
 
 ---
 
+## ADR-016: Money in Flight Is Held in a System Clearing Account
+
+**Status:** Accepted — refines how ADR-012's invariant applies to unsettled money
+**Date:** 2026-08-18
+
+**Context:**
+ADR-012 made a wallet's balance *defined as* `SUM(legs)`, with `Wallet.balance` a projection written
+in the same transaction. The first bank flow broke that silently: a pending deposit or withdrawal
+wrote balanced legs but left the projection where it was, so for any wallet that had used the bank
+endpoint `balance == SUM(legs)` was simply false (issue #26). The real question underneath was not
+the missing update but one ADR-012 had deferred: **where does money live while the bank has not yet
+answered?** A transfer to an external bank is two facts separated by minutes or days — "the customer
+asked" and "the money moved" — and a double-entry ledger has to give the gap between them an
+account.
+
+**Options Considered:**
+
+| Option | Pro | Con |
+|---|---|---|
+| Post nothing until settlement | No pending legs to reason about | A withdrawal is spendable twice while in flight; "what is in flight" becomes a status query instead of a balance |
+| Post `customer ↔ house` at submit, reverse on failure | One movement on the happy path | The house account then mixes settled float with unsettled intent; reconciliation cannot tell them apart |
+| Mixed: debit withdrawals at submit, credit deposits only at settlement | Never extends credit on a deposit that has not landed | Two posting shapes, branched in submit, settlement and the webhook — six places to keep in step |
+| **A dedicated `CLEARING` account, the same two-phase shape both directions** | One code path; in-flight money is one balance | Three movements in the worst case (hold, then settle or release) |
+
+**Decision:** Money in flight sits in a system-owned clearing account with its own account type, `CLEARING`. Submit moves the amount
+between the customer (or the house, for a deposit) and clearing; settlement moves it out of clearing
+to its destination; failure moves it back. Deposits and withdrawals use the same two-phase shape.
+The `Transaction` row records intent — house ↔ customer — and the clearing account appears only in
+the legs.
+
+**Rationale:**
+The deciding argument was code, not accounting. One posting shape means one path to test and reason
+about; the mixed strategy's risk argument — crediting a deposit before it lands extends credit to a
+stranger — is real but bounded here, because the pending amount sits in clearing, not in the
+customer's spendable balance. The exposure is visible and capped rather than handed out.
+
+Clearing also turns "what is in flight right now" into a single balance instead of a status query,
+which makes reconciliation against the bank a one-number comparison. A clearing balance that never
+drains is a defect signal in its own right. And `balance == SUM(legs)` becomes **continuously** true:
+the customer's projection moves at submit, with the legs, in the same transaction.
+
+Recording intent on the `Transaction` and mechanics in the legs keeps the clearing account out of
+customer-visible history. The first version named it as a party, and a customer's own deposit
+disappeared from their transaction list; the split, and tests on the history endpoint, came from
+that regression.
+
+**Trade-offs:**
+- A failed transfer is three movements, not one, and the ledger records the full life of each
+  attempt rather than only outcomes. Accepted: append-only history is the point.
+- Clearing is constrained like a customer account: the non-negative CHECK exempts only `SYSTEM`
+  (the house, which carries float), so a clearing balance below zero is refused by the database —
+  money cannot leave clearing that never entered it.
+- The customer is debited at submit for a withdrawal, so a slow bank holds their money in
+  clearing. That is the correct behaviour for an instruction already accepted, and the hold is
+  visible.
+
+**Revisit when:**
+- More than one provider holds money in flight → one clearing account per provider, so each
+  reconciles against its own statement.
+- Holds must expire (e.g. a transfer abandoned at the bank) → a scheduled release posting, not an
+  edit to the hold.
+
+---
+
 ## ADR-017: The Outbound Idempotency Key Is the Transaction Id, Sent Verbatim
 
 **Status:** Accepted — supersedes ADR-015's at-most-once limitation
@@ -750,6 +814,139 @@ revisit trigger rather than left to be rediscovered.
 
 ---
 
+## ADR-018: Webhook Trust — Signed, Fresh, Deduplicated, and Legal From the Current State
+
+**Status:** Accepted
+**Date:** 2026-11-20
+
+**Context:**
+The settlement callback is the only thing that moves money out of clearing (ADR-016), and it arrives
+from outside, at a public endpoint, possibly late, possibly twice, possibly out of order, and
+possibly from someone who is not the bank. A handler that believes the body — "this says transaction
+X settled for amount Y" — lets anyone who can reach the URL drain the clearing account. Four
+separate questions have to be answered before a callback is acted on, and each needs its own
+mechanism: *who sent it, is it current, have I already handled it, and is it legal from where the
+transfer actually is?*
+
+**Options Considered:**
+
+| Question | Option | Verdict |
+|---|---|---|
+| Who sent it | IP allowlisting | Rejected — brittle across provider infrastructure changes, and proves the network, not the message |
+| | mTLS | Rejected here — sound, but certificate issuance and rotation are heavy for two services one party operates |
+| | Trust the reference in the body | Rejected — this *is* the vulnerability: the body is attacker-controlled until authenticated |
+| | **HMAC-SHA256 over a shared secret per direction** | Adopted — the Stripe/Adyen/GitHub scheme |
+| Is it current | **Timestamp inside the signed material, 300s window** | Adopted |
+| Already handled | **Dedup on the delivery's `eventId`, plus a payload hash** | Adopted |
+| Legal now | **Transition guard against the transfer's current status** | Adopted |
+
+**Decision:**
+- **Signature.** `X-Signature: t={unix},v1={hex}` over `{t}.{METHOD}{path}.{raw body}`, verified
+  over the exact bytes received, before any JSON parsing, with a constant-time compare. Method and
+  path are signed so a captured signature cannot be replayed against another resource or as another
+  method: a query has no body and carries its reference in the path, so a body-only signature would
+  have verified against any reference. One secret per direction, so a leak forges traffic one way only.
+- **Freshness.** `|now − t| > 300s` is rejected with a distinct, retryable `SIGNATURE_EXPIRED`;
+  every other failure is an identical `401` so a probing caller learns nothing.
+- **Dedup.** The `WebhookEvent` insert on `eventId` is the claim, in the same transaction as the
+  effect. A redelivery with the same payload is acknowledged without effect; the same `eventId` with
+  a different payload is refused.
+- **Legality.** The transfer row is locked and the callback is applied only if the transition is
+  legal from its current status. A stale callback for a transfer already in that state is
+  acknowledged; one that contradicts a final state is recorded as a `STATE_MISMATCH` dispute.
+- **Amount is verified, never posted.** The engine posts the amount it put in flight; the callback's
+  amount is compared against it, and a mismatch is a dispute.
+- **Response codes report durability, not agreement.** `2xx` means durably recorded — applied,
+  duplicate, or disputed. `5xx` means not recorded, so redeliver. `4xx` only for a request that can
+  never be recorded: a bad signature or an unparseable body. Disputes live in `ReconciliationRecord`
+  (`DISPUTED` + `disputeReason`), where a sweep and an operator can both find them.
+
+**Rationale:**
+Dedup and legality answer different questions and neither substitutes for the other. Dedup asks
+"have I seen this *message*?" and keys on the delivery; legality asks "is this *outcome* still
+possible?" and keys on state. A settlement redelivered under a fresh `eventId` passes dedup and is
+stopped by legality; a duplicate of the same message is stopped by dedup before legality is even
+consulted. Together they make out-of-order and duplicated delivery converge to one final state
+without the engine knowing the delivery order.
+
+Answering a dispute with `2xx` was a reversal of the first design, which answered `422`. A retry
+cannot change a dispute: identical payload, identical records, identical refusal. A `4xx` therefore
+either provokes indefinite redelivery or is dead-lettered at the sender, and the signal is lost on
+both sides. The first design also produced a real bug — a first delivery answered `422` and its
+replay answered `200` — which a uniform `2xx` makes impossible to express.
+
+**Trade-offs:**
+- A shared secret means either side can forge the other's traffic if its store leaks. One secret per
+  direction contains a leak to one direction.
+- The 300s window admits a replay inside it. Dedup on `eventId` absorbs a replayed callback; a
+  replayed query only re-reads state.
+- Signing the method and path couples the signature to URL layout: both sides must agree on the
+  path byte for byte (the receiver reads the full request target, not a router-relative one).
+- The dedup record must outlive the bank's redelivery window, and a disputed record outlive it
+  further; retention is tracked separately (#27).
+
+**Revisit when:**
+- The bank is operated by another party → asymmetric signatures, or mTLS, so neither side holds a
+  key that can forge the other.
+- The signing format changes again → ship it as `v2=` beside `v1=` and retire `v1` once every
+  sender has moved; the version prefix exists for this.
+
+---
+
+## ADR-019: Compensation Inside a Transfer's Lifecycle Is More Legs on the Same Transaction
+
+**Status:** Accepted
+**Date:** 2026-11-20
+
+**Context:**
+A bank transfer that fails after its hold was posted (ADR-016) must give the money back. The ledger
+is append-only (ADR-012), so the release is necessarily new legs, never an edit. The open question
+is *where those legs hang*: on a new `Transaction` linked to the original, or on the original itself.
+
+**Options Considered:**
+
+| Option | Pro | Con |
+|---|---|---|
+| A separate `BANK_REVERSAL` transaction, linked by `reversalOfId` | A reversal is a row you can query by type | The reversal's parties are the original's swapped, so the customer sees **two** rows for one failed withdrawal |
+| The same, with reversals filtered out of the customer's history | One row in the customer's view | History lies by omission; the filter is a permanent exception every future reader of that query must know about |
+| **Second pair of legs on the same transaction** | One row per transfer; a failure nets to zero | "Was this reversed?" is a property of the legs, not a row type |
+
+**Decision:** Compensation inside a transfer's lifecycle — a hold released because the bank rejected
+the transfer — is a second balanced pair of legs on that same `Transaction`. Only compensation after
+a transfer reached a true terminal state (a return of an already-`SETTLED` transfer) is a new
+transaction.
+
+**Rationale:**
+The tempting argument — "compensation must be new history, not an edit" — does not discriminate
+between the two shapes at all. Both append, neither mutates, both are refused an `UPDATE` by the
+ledger's trigger, and conservation is asserted either way. Append-only constrains *editing*, not row
+count. It is recorded here because it is the reason most likely to be re-derived, and it is wrong.
+
+What actually decided it was customer-visible history. A failed withdrawal that becomes two rows in
+the customer's transaction list leaks internal mechanics into their view, which is the same failure
+ADR-016's intent/mechanics split exists to prevent. The second row also carried nothing not already
+recorded better: the bank's reason and timing are on the reconciliation record, where a dispute is
+argued. A failed transfer as four legs netting to zero is exactly what "it did not happen" looks like
+in double entry.
+
+A return is different in kind. The original reached `SETTLED`, which was *true*; appending release
+legs to it and walking its status backwards would edit a correct summary. That case earns its own
+row, and arrives with the returns flow.
+
+**Trade-offs:**
+- Settlement and release collapsed into one posting function: both endings release the same hold
+  and differ only in who receives it.
+- Answering "was this reversed?" now means reading the status and the leg count rather than a row
+  type. Acceptable while in-lifecycle compensation is the only kind.
+- Asserted by a test that one failed withdrawal is still one row in the customer's history; no
+  conservation check would ever catch the alternative.
+
+**Revisit when:**
+- Returns are built → a new transaction linked to the original, with the type and the link column
+  added then, not ahead of it.
+
+---
+
 ## ADR-020: The Bank Acknowledges; Every Outcome Arrives by Callback
 
 **Status:** Accepted
@@ -809,5 +1006,54 @@ it differed only in cancellability, which nothing offers: a state nothing branch
   carries the outcome.
 - Cancellation is offered → an in-flight state returns as the point after which a transfer can no
   longer be stopped.
+
+---
+
+## ADR-021: The Provider's Vocabulary Is Translated at the Boundary; Multi-Provider Is Designed, Not Built
+
+**Status:** Accepted
+**Date:** 2026-11-20
+
+**Context:**
+A callback carries the bank's words: its status, its event type, its rejection reason. Storing them
+as the engine's own is a money bug before it is a modelling concern. With a four-state provider
+enum and consumers that each handled two cases, an "in progress" notification could fall through to
+"success" and post a ledger entry. Reconciliation also has to hold disputes, which are argued in the
+provider's words, not the engine's.
+
+**Options Considered:**
+
+| Option | Pro | Con |
+|---|---|---|
+| Store the provider's values as the domain's | Nothing to map | The vendor's dialect reaches every consumer; a new provider value can silently mean the wrong thing |
+| Per-provider reconciliation tables | Each table matches one statement | "How much is unreconciled today?" becomes a `UNION` that grows with every integration |
+| A provider registry or plugin framework | Ready for many providers | An abstraction with one implementation |
+| **Canonical enum beside the raw value, one named mapping function** | Domain decides on its own terms; disputes keep the original words | The mapping must be extended deliberately per provider |
+
+**Decision:** Each callback is mapped at the boundary to a canonical set derived from what the
+ledger must decide — settled, failed, still pending — and stored alongside the provider's raw value.
+The mapping is an exhaustive switch with no fallback, so a value the provider adds fails the build
+until it is mapped. No provider discriminator, no per-provider module, no registry.
+
+**Rationale:**
+The canonical set is defined by the engine's decisions, not by what one bank happens to report, so
+it does not change when a provider does. The raw value is kept because a dispute is argued in the
+provider's words. At one provider the seam is a named function, and an abstraction around it would
+be speculation.
+
+The same rule was applied twice in this change, and that is what makes it general: **schema lands
+with the code that writes it.** A provider column at a constant value, and a reversal link with no
+code writing it, were both added and then removed. A column nothing sets is a claim the schema makes
+that the engine does not honour; a reviewer reads it as half-built, not as foresight.
+
+**Trade-offs:**
+- Event identity is the provider's `eventId` alone, sound only while one provider mints it.
+- The unmatched case stays representable: the internal transaction id on a reconciliation record is
+  nullable, so an event naming a payment the engine does not have is stored, not rejected.
+- Fees, FX and net amounts are not modelled until a provider deducts them.
+
+**Revisit when:**
+- A second provider is integrated → add the provider discriminator, make event identity composite,
+  and move each provider's mapping into its own adapter, all in one migration.
 
 ---

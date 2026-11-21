@@ -506,7 +506,7 @@ A callback that is syntactically valid and correctly signed, but contradicts the
 | `pspReferenceId` names no transfer the engine holds        | `UNKNOWN_REFERENCE` |
 | `status` contradicts a final state the transfer has reached | `STATE_MISMATCH`    |
 
-A callback of `type: RETURN` without `originalTrackingId` is malformed: `400 INVALID_REQUEST`.
+A callback of `type: RETURN` without `originalTrackingId` is malformed: `400`, and the bank stops delivering it (§3.3).
 
 Every dispute raises an alert. A correctly signed message that contradicts known state indicates a
 bank defect or a compromised secret; both require an operator. A dispute is not answered `4xx`,
@@ -757,7 +757,8 @@ The current implementation departs from this contract as follows. Each entry is 
 
 | Term                                   | Current behaviour                                                                                           |
 | -------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Callback (§3.3)                        | the engine does not yet receive callbacks; the bank marks each event `UNDELIVERABLE` after the engine's `404` |
 | `Retry-After` honoured (§8.2)          | the engine applies the §8.2 schedule regardless                                                             |
 | Query used for recovery (§3.2, §5.2)   | the bank serves the query; the engine has no client for it yet, so a request it stopped sending is resolved only by a callback |
+| Returns received (§1, §6.3)            | the engine records and acknowledges a `RETURN` callback but does not post it to the ledger                  |
 | Authentication failures logged (§2.3)  | neither side logs a rejected signature                                                                      |
+| Disputes alerted (§5.4)                | disputes are recorded in the reconciliation record; no alert is raised                                     |
