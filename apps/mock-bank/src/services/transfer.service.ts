@@ -16,11 +16,6 @@ export const BATCH_SIZE = 20;
 const MAX_DELIVERY_ATTEMPTS = 6;
 const LEASED_SECONDS = 130;
 const RESCHEDULE_AFTER = [10_000, 60_000, 300_000, 1_800_000, 7_200_000];
-const TERMINAL_ERROR_CODES = new Set([
-  "AUTHENTICATION_FAILED",
-  "INVALID_REQUEST",
-  "IDEMPOTENCY_KEY_REUSED",
-]);
 
 function backoffMs(attempts: number): number {
   return RESCHEDULE_AFTER[attempts - 1] ?? 0;
@@ -171,12 +166,10 @@ function isTerminal(error: unknown): boolean {
     if (status === undefined) {
       return false;
     }
-    const code = bankErrorCode(error);
-    if (code === "SIGNATURE_EXPIRED") {
+    // By status, per contract §3.3 — the bank can't know every engine code. An expired signature
+    // is the one 4xx a fresh attempt fixes.
+    if (bankErrorCode(error) === "SIGNATURE_EXPIRED") {
       return false;
-    }
-    if (code !== undefined) {
-      return TERMINAL_ERROR_CODES.has(code);
     }
     return status >= 400 && status < 500 && status !== 429;
   }

@@ -35,13 +35,19 @@ export class ConflictError extends AppError {
 }
 
 export class UnauthorizedError extends AppError {
-  constructor(message: string) {
-    super("UNAUTHORIZED", message, 401);
+  constructor(message: string, code: string = "UNAUTHORIZED") {
+    super(code, message, 401);
   }
 }
 
 export class InsufficientFundsError extends AppError {
   constructor(message: string) {
     super("INSUFFICIENT_FUNDS", message, 402);
+  }
+}
+
+export class IdempotencyError extends AppError {
+  constructor(message: string) {
+    super("IDEMPOTENCY_KEY_REUSED", message, 422);
   }
 }

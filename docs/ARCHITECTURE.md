@@ -3,7 +3,7 @@
 > This document describes the system as it currently exists.
 > It is rewritten as the system evolves — not appended to.
 > At any point it reads as a coherent whole, not a changelog.
-> Last updated: Layer 2
+> Last updated: asynchronous bank settlement
 
 ---
 
@@ -11,8 +11,11 @@
 
 A payments engine that enables users to move money in two ways:
 
-- **P2P transfers** — send money directly to another user
-- **Bank operations** — add funds from a linked bank account or withdraw to one
+- **P2P transfers** — send money directly to another user, settled immediately
+- **Bank operations** — add funds from a bank or withdraw to one, settled asynchronously by the bank
+
+The second is the harder one: money leaves the engine's control, the bank answers later — possibly
+twice, out of order, or not at all — and the ledger has to stay provably correct throughout.
 
 ---
 
@@ -23,32 +26,37 @@ A payments engine that enables users to move money in two ways:
 │         Client (Next.js)        │
 └────────────────┬────────────────┘
                  │ HTTPS
-┌────────────────▼────────────────┐
-│       API Server (Express)      │
-│                                 │
-│  Auth Middleware (JWT)          │
-│  Input Validation (Zod)         │
-│                                 │
-│  /auth/*   → AuthService        │
-│  /wallet/* → WalletService      │
-└────────────────┬────────────────┘
-                 │ ONE transaction: ledger legs + outbox row
-┌────────────────▼──────────────────────────────┐
-│                 PostgreSQL                    │
-│  Users · Wallets · LedgerEntry · Transactions │
-│  IdempotencyRecord · TransactionOutbox        │
-│  BankRequest                                  │
-└───────┬───────────────────────────────▲───────┘
-        │ LISTEN/NOTIFY + claim          │ dedup key
-┌───────▼─────────┐   BullMQ   ┌─────────┴───────┐
-│  Outbox Relay   ├───────────►│  Bank  Worker   │
+┌────────────────▼────────────────┐                    ┌───────────────────────────┐
+│       API Server (Express)      │◄── signed callback ┤   Mock bank (apps/mock-   │
+│                                 │    POST /webhook   │   bank) — its own process │
+│  Auth Middleware (JWT)          │                    │   and its own database    │
+│  Input Validation (Zod)         │                    │                           │
+│                                 │                    │  POST /transfer  (submit) │
+│  /auth/*    → AuthService       │                    │  GET  /transfer/{ref}     │
+│  /wallet/*  → WalletService     │                    │  processor: settles       │
+│  /webhook/* → BankWebhookService│                    │  notifier:  delivers      │
+└────────────────┬────────────────┘                    └─────────────▲─────────────┘
+                 │ ONE transaction: ledger legs + outbox row          │ signed submit
+┌────────────────▼──────────────────────────────────┐                 │
+│                    PostgreSQL                     │                 │
+│  Users · Wallets · LedgerEntry · Transactions     │                 │
+│  IdempotencyRecord · TransactionOutbox            │                 │
+│  BankRequest · WebhookEvent · ReconciliationRecord│                 │
+└───────┬───────────────────────────────▲───────────┘                 │
+        │ LISTEN/NOTIFY + claim          │ request state               │
+┌───────▼─────────┐   BullMQ   ┌─────────┴───────┐                    │
+│  Outbox Relay   ├───────────►│  Bank  Worker   ├────────────────────┘
 │  (publisher)    │   Redis    │  (consumer)     │
 └─────────────────┘            └─────────────────┘
 ```
 
-The request path writes to **one** store. Everything crossing into a second store
-(Redis) happens out of band, in the relay — see ADR-013. The relay and worker are
-separate processes (`npm run dev:relay`, `npm run dev:worker`), not threads of the API.
+The request path writes to **one** store. Everything crossing into a second store (Redis) happens out
+of band, in the relay (ADR-013). The worker submits to the bank and records only that the bank
+accepted; the outcome arrives later as a signed callback, which is the only thing that settles money
+(ADR-020). The relay and worker are separate processes, not threads of the API.
+
+The bank is specified by [`docs/bank-api-contract.md`](bank-api-contract.md). `apps/mock-bank` is its
+reference implementation and the engine's test counterpart, not a product.
 
 ---
 
@@ -59,132 +67,86 @@ User ──1:1──► Wallet
 User ──1:N──► Transaction  (as sender)
 User ──1:N──► Transaction  (as receiver)
 Wallet ──1:N──► LedgerEntry       (its signed legs; balance = SUM(legs))
-Transaction ──1:N──► LedgerEntry  (the balanced legs of one movement)
+Transaction ──1:N──► LedgerEntry  (the balanced legs of every movement it went through)
 Transaction ──1:1──► TransactionOutbox  (the async work that movement owes)
 Transaction ──1:1──► BankRequest        (the instruction sent to the bank, and how far it got)
+WebhookEvent ──1:N──► ReconciliationRecord  (the bank's callbacks, and what they matched)
 ```
 
 ### Schema
 
 ```prisma
-model User {
-  id           String        @id @default(uuid())
-  email        String        @unique
-  phoneNumber  String        @unique
-  firstName    String
-  lastName     String
-  passwordHash String
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-
-  wallet       Wallet?
-  sentTxns     Transaction[] @relation("SentTransactions")
-  receivedTxns Transaction[] @relation("ReceivedTransactions")
-}
-
 model Wallet {
   id          String      @id @default(uuid())
   userId      String      @unique
   balance     Decimal     @db.Decimal(20, 2)  // cached projection of SUM(ledger legs)
   currency    String      @default("INR")
-  accountType AccountType @default(CUSTOMER)   // CUSTOMER | SYSTEM (the house)
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
-
-  user   User          @relation(fields: [userId], references: [id])
-  ledger LedgerEntry[]
+  accountType AccountType @default(CUSTOMER)   // CUSTOMER | SYSTEM (the house) | CLEARING
+  ...
 }
 
 model LedgerEntry {            // append-only; a wallet's balance = SUM(amount)
-  id            String      @id @default(uuid())
+  id            String   @id @default(uuid())
   walletId      String
-  transactionId String                          // groups the balanced legs of one movement
-  amount        Decimal     @db.Decimal(20, 2)   // signed: debit −, credit +
-  createdAt     DateTime    @default(now())
-
-  wallet      Wallet      @relation(fields: [walletId], references: [id])
-  transaction Transaction @relation(fields: [transactionId], references: [id])
-
-  @@index([walletId])
-  @@index([transactionId])
+  transactionId String                        // groups the legs of one transaction
+  amount        Decimal  @db.Decimal(20, 2)   // signed: debit −, credit +
+  createdAt     DateTime @default(now())
 }
 
-model Transaction {
-  id         String            @id @default(uuid())
+model Transaction {            // the customer's intent: house ↔ customer, never the clearing account
+  id         String            @id @default(uuid())   // also the key the bank dedups on (ADR-017)
   fromUserId String
   toUserId   String
   amount     Decimal           @db.Decimal(20, 2)
-  type       TransactionType
-  status     TransactionStatus
-  note       String?
-  createdAt  DateTime          @default(now())
-
-  fromUser User          @relation("SentTransactions", fields: [fromUserId], references: [id])
-  toUser   User          @relation("ReceivedTransactions", fields: [toUserId], references: [id])
-  ledger   LedgerEntry[]
-
-  @@index([fromUserId, createdAt])
-  @@index([toUserId, createdAt])
+  type       TransactionType   // P2P_TRANSFER | BANK_DEPOSIT | BANK_WITHDRAWAL | OPENING_BALANCE
+  status     TransactionStatus // PENDING | SUCCESS | FAILED
+  ...
 }
 
-model IdempotencyRecord {        // request-level dedup: one claim per (user, key)
+model IdempotencyRecord {      // request-level dedup: one claim per (user, key)
   userId         String
   idempotencyKey String
-  requestHash    String          // sha256 of the request — detects key reuse
-  response       String?         // the original result, replayed on a duplicate
-  createdAt      DateTime @default(now())
-
+  requestHash    String        // sha256 of the request — detects key reuse
+  response       String?       // the original result, replayed on a duplicate
   @@id([userId, idempotencyKey])
-  @@index([createdAt])
 }
 
-model TransactionOutbox {                          // written INSIDE the transfer's transaction
-  id            String            @id @default(uuid())  // the event identity the consumer dedupes on
-  transactionId String            @unique              // 1:1 with the movement (command style, ADR-014)
-  type          TransactionType
-  status        TransactionStatus
-  amount        Decimal           @db.Decimal(20, 2)
-  userId        String
-  publishStatus OutboxStatus      @default(PENDING)    // PENDING → PUBLISHED | FAILED
-  attempts      Int               @default(0)
-  nextAttemptAt DateTime          @default(now())      // backoff gate: a failing row steps aside
-  createdAt     DateTime          @default(now())
-
-  @@index([publishStatus, createdAt])                  // the relay's claim, oldest first
+model TransactionOutbox {      // written INSIDE the transfer's transaction
+  id            String       @id @default(uuid())  // the event identity the worker dedups on
+  transactionId String       @unique               // 1:1 with the movement (ADR-014)
+  publishStatus OutboxStatus @default(PENDING)     // PENDING → PUBLISHED | FAILED
+  attempts      Int          @default(0)
+  nextAttemptAt DateTime     @default(now())       // backoff gate: a failing row steps aside
+  ...
 }
 
-model BankRequest {              // committed BEFORE the bank is called
-  eventId       String            @id      // the outbox row id: consumer-level dedup
-  transactionId String            @unique  // also the key the bank dedups on (ADR-017)
-  status        BankRequestStatus          // SUBMITTING → SUBMITTED | HALTED (ADR-020)
-  bankReference String?                    // the bank's trackingId, once accepted
+model BankRequest {            // committed BEFORE the bank is called
+  eventId       String            @id              // the outbox row id
+  transactionId String            @unique
+  status        BankRequestStatus                  // SUBMITTING → SUBMITTED | HALTED
+  bankReference String?                            // the bank's trackingId, once accepted
   lastError     String?
 }
 
-enum TransactionType {
-  P2P_TRANSFER
-  BANK_DEPOSIT
-  BANK_WITHDRAWAL
-  OPENING_BALANCE
+model WebhookEvent {           // inbound dedup + evidence
+  eventId     String  @id     // the bank's delivery id
+  requestHash String          // same id, different body → refused
+  payload     Json            // verbatim, as received
+  response    String?         // the outcome recorded for this delivery
 }
 
-enum OutboxStatus {
-  PENDING
-  PUBLISHED
-  FAILED
-}
-
-enum TransactionStatus {
-  PENDING
-  SUCCESS
-  FAILED
-}
-
-enum AccountType {
-  CUSTOMER
-  SYSTEM
+model ReconciliationRecord {   // one per bank transfer record: current matching state
+  providerReferenceId  String  @unique   // the bank's trackingId
+  transactionId        String?           // nullable: an unknown reference is still storable
+  status               TransactionStatus // canonical …
+  rawStatus            String            // … beside the bank's own word (ADR-021)
+  reconciliationStatus ReconciliationStatus  // PENDING | COMPLETED | DISPUTED
+  disputeReason        DisputeReason?        // AMOUNT_MISMATCH | UNKNOWN_REFERENCE | STATE_MISMATCH
+  ...
 }
 ```
+
+The full schema is `packages/db/prisma/schema.prisma`; this excerpt keeps the fields the design turns on.
 
 ### Key schema decisions
 
@@ -197,29 +159,33 @@ Sequential IDs expose user count and enable enumeration attacks.
 UUIDs are opaque and safe to expose in URLs and API responses.
 
 **Wallet created atomically with User**
-A User without a Wallet is an invalid system state.
-Both are created inside a single Prisma `$transaction` at registration.
-If wallet creation fails, the user record is rolled back.
+A User without a Wallet is an invalid system state. Both are created inside a single
+`$transaction` at registration; if wallet creation fails, the user record is rolled back.
 
 **Balance is derived, not stored (ADR-012)**
-Every movement writes immutable, signed `LedgerEntry` legs; a wallet's balance is
-`SUM(legs)`. `Wallet.balance` is a cached projection written in the *same* transaction
-as the legs, so it cannot drift — **for settled movements**. Bank transfers are the
-open exception: they commit as `PENDING` and write their legs immediately while
-deliberately not moving the projection, because a customer must not be able to spend
-money the bank has not delivered. Until settlement resolves them, those two views of a
-wallet disagree by the pending amount. See the limitations table below. Legs are append-only — a DB trigger blocks
-`UPDATE`/`DELETE`. `accountType` marks the house/system account (the counter-leg for
-opening-balance and, later, bank movements), which is exempt from the non-negativity
-rule so it can carry the system's float.
+Every movement writes immutable, signed `LedgerEntry` legs; a wallet's balance is `SUM(legs)`.
+`Wallet.balance` is a cached projection written in the *same* transaction as the legs, inside the
+same row lock, so `balance == SUM(legs)` holds continuously — including while a bank transfer is in
+flight. Legs are append-only: a database trigger refuses `UPDATE` and `DELETE`, so a correction is
+always new legs.
+
+**Money in flight has its own account (ADR-016)**
+Three account types: `CUSTOMER`, `SYSTEM` (the house, which carries the system's float and may go
+negative), and `CLEARING`, which holds money the bank has not yet settled. The non-negative CHECK
+exempts only `SYSTEM`, so clearing can never pay out money that never entered it. `Transaction`
+records the customer's intent (house ↔ customer); the clearing account exists only in the legs, so it
+never appears in a customer's history.
 
 **The queue handoff is a row, not a `queue.add` (ADR-013)**
-`TransactionOutbox` exists because Postgres and Redis cannot commit together. The intent
-to publish is written as a row in the *same* transaction as the money, so one commit means
-both "money moved" and "event owed". Two dedup identities live in the schema for two
-different boundaries: `IdempotencyRecord` keyed by the caller's `Idempotency-Key` (an HTTP
-retry), and `BankRequest` keyed by the outbox row id (a queue redelivery), which also records
-how far the bank call got. Both are decided by the database, never by an application-level "have I seen this?" read.
+`TransactionOutbox` exists because Postgres and Redis cannot commit together. The intent to publish is
+written in the *same* transaction as the money, so one commit means both "money moved" and "event
+owed".
+
+**Three dedup identities, one per boundary**
+`IdempotencyRecord` (the client's `Idempotency-Key` — an HTTP retry), `BankRequest.eventId` (the outbox
+row id — a queue redelivery), and `WebhookEvent.eventId` (the bank's delivery id — a callback
+redelivery). Each is decided by a database constraint, never by an application-level "have I seen
+this?" read. A fourth key is outbound: the bank dedups on `Transaction.id` (ADR-017).
 
 ---
 
@@ -265,34 +231,26 @@ Auth middleware: extracts senderId from JWT — never from body
 
   → Zod validates: amount > 0, receiverId is valid UUID
   → senderId !== receiverId
-  → Fetch sender wallet
-  → Check balance >= amount
   → prisma.$transaction([
       lock both wallet rows (SELECT … FOR UPDATE, ordered by userId),
+      check balance >= amount,
+      create Transaction record (status: SUCCESS),
       write two balanced ledger legs (sender −amount, receiver +amount),
-      update both cached balances (the projection of SUM(legs)),
-      create Transaction record (status: SUCCESS)
+      update both cached balances (the projection of SUM(legs))
     ])
   → Return: { transactionId, newBalance, timestamp }
 
 Failure cases:
-  → Insufficient balance        → 422 Unprocessable Entity
-  → Receiver not found          → 404 Not Found
-  → Sender === receiver         → 400 Bad Request
+  → Insufficient balance        → 402 Payment Required
+  → Receiver not found          → 404 Not Found (also for a system account)
+  → Sender === receiver         → 409 Conflict
   → DB transaction fails        → 500, rolled back atomically
 
-✓ Concurrency-safe (Layer 2): the transfer locks BOTH wallet rows with
-  SELECT … FOR UPDATE, ordered by userId, inside the transaction. Concurrent
-  transfers from the same wallet can no longer overdraft, and opposite-direction
-  transfers cannot deadlock. See ADR-010.
-
-✓ Double-entry (Layer 2): each transfer is two balanced ledger legs that sum to
-  zero; the wallet balance is a projection of SUM(legs), written in the same
-  transaction so it can never drift. Legs are append-only (a DB trigger blocks
-  UPDATE/DELETE), so corrections are new legs, never mutations. See ADR-012.
+Locking both rows in a deterministic order makes concurrent transfers from one wallet unable to
+overdraft and opposite-direction transfers unable to deadlock (ADR-010).
 ```
 
-### POST /wallet/banktransfer
+### POST /wallet/banktransfer — the hold
 
 ```
 Client sends: { direction: "deposit" | "withdrawal", amount }
@@ -301,11 +259,12 @@ Header: Idempotency-Key
 
   → Zod validates: direction, amount (precision matches Decimal(20,2))
   → runIdempotent claims the key, then inside the SAME transaction:
-      lock both wallet rows (the user's and the house's, ordered by userId),
-      check funds (withdrawal only — the house is exempt, it carries the float),
-      write two balanced ledger legs,
-      create Transaction record (status: PENDING — the bank has not answered yet),
-      insert TransactionOutbox row  ← the "publish this" intent, same commit
+      lock the source and clearing wallet rows (ordered by userId),
+      check funds (withdrawal only),
+      create Transaction (status: PENDING; parties = house ↔ customer),
+      post the hold:   withdrawal  customer → clearing
+                       deposit     house    → clearing
+      insert TransactionOutbox row  ← the "submit this" intent, same commit
   → Return: { sender, receiver, amount, timestamp, status: PENDING, type }
 
 Failure cases:
@@ -313,11 +272,11 @@ Failure cases:
   → Wallet not found            → 404 Not Found
   → Key reused, other request   → 409 Conflict
 
-✗ No queue.add anywhere on this path. If the process dies the instant after commit,
-  the event is still owed — it is a committed row, not a lost in-flight call.
+No queue.add and no bank call on this path. If the process dies the instant after commit, the
+submit is still owed — it is a committed row, not a lost in-flight call.
 ```
 
-### Outbox pipeline (relay → BullMQ → worker)
+### Outbox pipeline (relay → BullMQ → worker → bank)
 
 ```
 Producer commits ──► NOTIFY outbox_notification (part of that same transaction)
@@ -325,16 +284,13 @@ Producer commits ──► NOTIFY outbox_notification (part of that same transac
 Relay (own process)  LISTEN ┘  + 5s fallback poll (NOTIFY is best-effort)
   → claim:   SELECT … WHERE publishStatus='PENDING' AND nextAttemptAt <= now()
              ORDER BY createdAt FOR UPDATE SKIP LOCKED LIMIT 200
-             (SKIP LOCKED = the multi-instance claim: N relays partition the backlog)
-  → publish: queue.add(...) for every claimed row      ← Redis only, no SQL
-  → mark:    updateMany published rows → PUBLISHED     ← SQL only, no Redis
-  → poison:  row-attributable failures get attempts+1 and an exponential
-             nextAttemptAt; at 5 they become FAILED (visible, re-drivable).
-             Transient (infra) failures abandon the batch and burn no attempts.
+  → publish: queue.add(...) per row, jobId = outbox row id   ← Redis only
+  → mark:    PUBLISHED                                       ← SQL only
+  → poison:  row-attributable failures back off; at 5 attempts → FAILED (visible,
+             re-drivable). Infrastructure failures burn no attempts.
 
 Worker (own process), per job — 8 attempts, exponential backoff from 2s with 50% jitter:
-  → Zod-parse job.data (the queue is a JSON boundary; a bad payload is
-    UnrecoverableError — permanent, not retried to the same verdict)
+  → Zod-parse job.data (a bad payload stops the job; it is not retried to the same verdict)
   → claim:   INSERT BankRequest(eventId, status SUBMITTING) ON CONFLICT DO NOTHING
              — committed BEFORE the bank is called, so a crash leaves an in-doubt row,
                never an absence
@@ -342,16 +298,40 @@ Worker (own process), per job — 8 attempts, exponential backoff from 2s with 5
                    SUBMITTED  → done
                    HALTED     → done; re-drive is an operator action
   → submit:  POST /api/v1/transfer { pspReferenceId: Transaction.id, amount, currency }
-             signed (HMAC over timestamp, method, path and body), 5s wall-clock timeout
+             signed (HMAC over method, path and body), 5s wall-clock timeout
   → 202:     BankRequest → SUBMITTED, bankReference = trackingId. No ledger write.
-  → refused (400/401/422), an unreadable 202, or the last attempt failed:
+  → refused (400/401/422) or unreadable 202, or last attempt failed:
              BankRequest → HALTED. Resolves nothing — the transfer may still have landed.
-
-Guarantees: the intent commits atomically with the money; delivery is at-least-once;
-the attempt is recorded before the call, and a retry is safe because the bank
-deduplicates on the transaction id (ADR-017). The worker never moves money: every
-outcome arrives by callback (ADR-020).
 ```
+
+### POST /webhook/payment — settlement (bank → engine)
+
+```
+Mounted with express.raw, ahead of express.json: the signature is over the exact bytes.
+
+  → verify X-Signature: HMAC over "{t}.{METHOD}{path}.{raw body}", |now − t| ≤ 300s,
+    constant-time compare — only then JSON.parse and Zod-validate
+  → one transaction:
+      claim WebhookEvent(eventId, payload hash)
+        same id + same payload  → duplicate, acknowledge, no effect
+        same id + other payload → 422 IDEMPOTENCY_KEY_REUSED
+      lock the Transaction row; match reference and amount (verified, never posted)
+      classify against the transaction's CURRENT status:
+        RETURN                       → record, acknowledge (the returns flow is not built)
+        RECEIVED callback            → acknowledge
+        PENDING + SETTLED/REJECTED   → apply
+        same final state again       → already resolved
+        contradicts a final state    → dispute (STATE_MISMATCH)
+      upsert ReconciliationRecord (canonical + raw values, dispute if any)
+      apply:  SETTLED   clearing → destination (customer for a deposit, house for a withdrawal)
+              REJECTED  clearing → source (the hold is released, on the SAME transaction)
+  → 200 for every recorded outcome — applied, duplicate or disputed
+    400 malformed · 401 bad signature · 5xx could not record (the bank redelivers)
+```
+
+A failed bank transfer is one `Transaction` whose four legs net to zero (ADR-019). Dedup on the
+delivery and the transition guard on state are independent: together they make duplicated and
+out-of-order callbacks converge to one final state (ADR-018).
 
 ### GET /wallet/balance
 
@@ -396,20 +376,23 @@ failure, and finish the batch in flight on `SIGTERM`.
 
 ---
 
-## Known Limitations (Layer 1)
+## Known Limitations
 
-These are intentional. Each will be demonstrated as a failure, then fixed.
-
-| Limitation | Risk | Fix in |
+| Limitation | Risk | Status |
 |---|---|---|
-| No `SELECT FOR UPDATE` on transfer | Concurrent transfers can overdraft | ✅ Fixed — ADR-010 |
-| No idempotency keys | Duplicate requests send money twice | ✅ Fixed — request-level dedup + retention reaper |
-| Balance as scalar, not ledger | Cannot audit or reconstruct history | ✅ Fixed — ADR-012 |
-| Enqueue outside the transaction | A crash after commit loses the event | ✅ Fixed — ADR-013 |
-| Bank transfers never settle | They are submitted, but no callback is received, so they stay `PENDING` | Open — the webhook is the next change |
-| A pending bank transfer writes legs but not the projection | `Wallet.balance != SUM(legs)` until settlement | ✅ Fixed — money in flight is held in a clearing account (#26) |
-| Consumer claims before it acts | A crash mid-handler loses that one effect | ✅ Fixed — request state recorded before the call + outbound key (ADR-017) |
-| No refresh tokens | Stolen JWT has no revocation path | Layer 2 |
+| No engine client for the bank's query endpoint | A `HALTED` request is resolved only if a callback arrives | Open — the reconciliation sweep is its caller |
+| Returns are recorded and acknowledged, not applied | A bank-initiated return does not move money in the ledger | Open — the returns flow adds its own transaction (ADR-019) |
+| Disputes are recorded, not alerted | A dispute is visible only by querying `ReconciliationRecord` | Open — relay metrics and re-drive (#28) |
+| Outbox, dedup and webhook records are never pruned | Tables grow without bound | Open — retention (#27) |
+| `Retry-After` is not honoured on a `429` | The worker retries on its own schedule | Open — contract Appendix B |
+| No refresh tokens | A stolen JWT has no revocation path | Open (ADR-007) |
+| ~~No row locking on transfer~~ | Concurrent transfers could overdraft | Fixed — ADR-010 |
+| ~~No idempotency keys~~ | Duplicate requests sent money twice | Fixed — request-level dedup + retention reaper |
+| ~~Balance as a scalar~~ | No audit or reconstruction | Fixed — ADR-012 |
+| ~~Enqueue outside the transaction~~ | A crash after commit lost the event | Fixed — ADR-013 |
+| ~~Pending bank legs skipped the projection~~ | `balance != SUM(legs)` while in flight | Fixed — ADR-016 (#26) |
+| ~~Bank transfers never settled~~ | `PENDING` forever | Fixed — signed callbacks, ADR-018 / ADR-020 |
+| ~~Consumer claimed before it acted~~ | A crash could lose a bank call | Fixed — request state + outbound key, ADR-017 |
 
 ---
 
@@ -419,36 +402,47 @@ These are intentional. Each will be demonstrated as a failure, then fixed.
 
 ```yaml
 # docker-compose.yml runs:
-postgres:  port 5432  (payments DB)
-bank:      port 5433  (the mock bank's own database)
-redis:     port 6379  (BullMQ dispatch — no volume: jobs are disposable,
-                       Postgres holds the truth and the relay re-publishes)
+db:     port 5432  (the engine's database)
+bank:   port 5433  (the mock bank's own database)
+redis:  port 6379  (BullMQ dispatch — no volume: jobs are disposable,
+                    Postgres holds the truth and the relay re-publishes)
 ```
 
-Three processes in development, each with its own entrypoint:
+Six processes in development, each with its own entrypoint:
 
 ```
-npm run dev          API server        apps/api/src/index.ts
-npm run dev:relay    outbox publisher  apps/api/src/relay.ts   → src/outbox/relay.ts
-npm run dev:worker   bank consumer     apps/api/src/worker.ts  → src/outbox/consumer.ts
+apps/api        npm run dev             API server        src/index.ts
+                npm run dev:relay       outbox publisher  src/relay.ts   → src/outbox/relay.ts
+                npm run dev:worker      bank submitter    src/worker.ts  → src/outbox/consumer.ts
+apps/mock-bank  npm run dev             bank API (:8080)  src/index.ts
+                npm run dev:processor   settlement        src/processor.ts
+                npm run dev:notifier    callback delivery src/notifier.ts
 ```
 
-The mock bank runs as three more, from `apps/mock-bank`: `npm run dev` (its API, port 8080),
-`npm run dev:processor` (settlement) and `npm run dev:notifier` (callback delivery). It is specified
-by [`docs/bank-api-contract.md`](bank-api-contract.md); the engine submits to it, but does not yet receive its callbacks.
-
-Neither background process is required for the API to accept a bank transfer — the
-outbox row simply accumulates as `PENDING` and drains when the relay comes back. That
-is the safe direction, and it is what makes the relay restartable without ceremony.
+No background process is required for the API to accept a bank transfer — the outbox row simply
+accumulates as `PENDING` and drains when the relay comes back. That is the safe direction, and it is
+what makes every background process restartable without ceremony.
 
 ### Environment Variables
 
 ```
-DATABASE_URL   postgresql://postgres:postgres@localhost:5432/payments
-REDIS_URL      redis://localhost:6379   (no default in code — an unset value fails fast)
-JWT_SECRET     (set locally, never committed)
-PORT           3001
-BANK_TRANSFER_HOST     http://localhost:8080
-BANK_TRANSFER_URL      /api/v1/transfer      (the path is also what the request signs)
-ENGINE_TO_BANK_SECRET  signs submits (contract §2.2)
+apps/api
+  DATABASE_URL           postgresql://…@localhost:5432/payments_system
+  REDIS_URL              redis://localhost:6379   (no default in code — an unset value fails fast)
+  JWT_SECRET             (set locally, never committed)
+  PORT                   3001
+  BANK_TRANSFER_HOST     http://localhost:8080
+  BANK_TRANSFER_URL      /api/v1/transfer        (the path is also what the request signs)
+  ENGINE_TO_BANK_SECRET  signs submits and queries
+  BANK_TO_ENGINE_SECRET  verifies callbacks
+
+apps/mock-bank
+  DATABASE_URL           postgresql://…@localhost:5433/payments_system_mock_bank
+  WEBHOOK_HOST           http://localhost:3001
+  WEBHOOK_URL            /api/v1/webhook/payment
+  ENGINE_TO_BANK_SECRET  verifies submits and queries
+  BANK_TO_ENGINE_SECRET  signs callbacks
 ```
+
+Every required variable is read through `requireEnv` at startup, so a missing one fails the process
+before it accepts work.

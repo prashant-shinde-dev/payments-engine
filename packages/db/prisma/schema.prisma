@@ -105,6 +105,45 @@ model BankRequest {
   updatedAt     DateTime          @updatedAt
 }
 
+model WebhookEvent {
+  eventId     String   @id // the provider's own event id — their dedup identity, not ours
+  requestHash String // sha256 of the payload — detects same id, different body
+  payload     Json // verbatim body, exactly as received. Never normalised, never migrated.
+  response    String? // outcome recorded for this delivery; observability only — every recorded outcome answers 2xx (ADR-018)
+  createdAt   DateTime @default(now())
+
+  reconciliation ReconciliationRecord[]
+
+  @@index([createdAt])
+}
+
+model ReconciliationRecord {
+  id                   String                  @id @default(uuid())
+  providerReferenceId  String
+  transactionId        String?
+  originalReferenceId  String?
+  status               TransactionStatus       @default(PENDING)
+  rawStatus            String
+  type                 ReconciliationEventType
+  rawType              String
+  failureReason        FailureReason?
+  rawFailureReason     String?
+  amount               Decimal                 @db.Decimal(20, 2)
+  currency             String
+  providerReceivedAt   DateTime?
+  providerSettledAt    DateTime?
+  reconciliationStatus ReconciliationStatus    @default(PENDING)
+  disputeReason        DisputeReason?
+  providerEventId      String
+  providerEvent        WebhookEvent            @relation(fields: [providerEventId], references: [eventId])
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+
+  @@unique([providerReferenceId])
+  @@index([reconciliationStatus, createdAt])
+  @@index([transactionId])
+}
+
 enum TransactionType {
   P2P_TRANSFER
   BANK_DEPOSIT
@@ -128,6 +167,33 @@ enum OutboxStatus {
   PENDING
   PUBLISHED
   FAILED
+}
+
+enum ReconciliationEventType {
+  SETTLEMENT
+  RETURN
+}
+
+enum DisputeReason {
+  AMOUNT_MISMATCH
+  UNKNOWN_REFERENCE
+  STATE_MISMATCH
+}
+
+enum ReconciliationStatus {
+  PENDING
+  COMPLETED
+  DISPUTED
+}
+
+enum FailureReason {
+  INSUFFICIENT_FUNDS
+  ACCOUNT_CLOSED
+  ACCOUNT_NOT_FOUND
+  INVALID_ACCOUNT
+  ACCOUNT_BLOCKED
+  LIMIT_EXCEEDED
+  CURRENCY_NOT_SUPPORTED
 }
 
 enum BankRequestStatus {

@@ -19,6 +19,11 @@ export type {
   TransactionOutbox,
   BankRequest,
   BankRequestStatus,
+  ReconciliationRecord,
+  DisputeReason,
+  ReconciliationStatus,
+  ReconciliationEventType,
+  FailureReason,
 } from "./generated/prisma/client.js";
 
 export { Prisma } from "./generated/prisma/client.js";
